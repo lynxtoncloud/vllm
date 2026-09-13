@@ -119,7 +119,8 @@ def test_local_descriptors_follow_each_region_pool_capacity():
 
 
 @pytest.mark.cpu_test
-def test_overlaid_transfer_groups_share_region_geometry():
+@pytest.mark.parametrize("padded_tail", [False, True])
+def test_overlaid_transfer_groups_share_region_geometry(padded_tail):
     """Groups overlaid on one allocation share its transfer region."""
     import msgspec
 
@@ -131,6 +132,7 @@ def test_overlaid_transfer_groups_share_region_geometry():
         NixlConnectorWorker,
     )
     from vllm.v1.kv_cache_interface import (
+        KpoolTailSpec,
         KVCacheConfig,
         KVCacheGroupSpec,
         KVCacheTensor,
@@ -151,6 +153,26 @@ def test_overlaid_transfer_groups_share_region_geometry():
         "layer.0": backing[:, :page_size],
         "layer.1": backing[:, :page_size],
     }
+    payload_size = page_size
+    if padded_tail:
+        # Exact failed server geometry, with an offset into larger storage:
+        # shape=(1145,2,4,128), strides=(6336,512,128,1), nbytes=2344960.
+        num_blocks, page_size, block_stride, payload_size = 1145, 12672, 12672, 2048
+        spec = KpoolTailSpec(
+            block_size=4,
+            num_kv_heads=2,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+            sliding_window=4,
+            page_size_padded=page_size,
+        )
+        backing = torch.zeros(2 * num_blocks + 1, block_stride, dtype=torch.uint8)
+        tail = backing[1 : num_blocks + 1, :payload_size].view(torch.bfloat16)
+        tail = tail.view(num_blocks, 2, 4, 128)
+        assert tail.stride() == (6336, 512, 128, 1)
+        assert tail.nbytes == 2344960
+        caches = {"layer.0": tail, "layer.1": tail}
     groups = [KVCacheGroupSpec([layer_name], spec) for layer_name in caches]
 
     worker = object.__new__(NixlConnectorWorker)
@@ -238,9 +260,12 @@ def test_overlaid_transfer_groups_share_region_geometry():
         (backing.data_ptr(), backing.nbytes, 0, "")
     ]
     expected_addrs = [
-        backing.data_ptr() + block * block_stride for block in range(num_blocks)
+        caches["layer.0"].data_ptr() + block * block_stride
+        for block in range(num_blocks)
     ]
     assert worker.src_blocks_data[:, 0].tolist() == expected_addrs
+    assert worker.src_blocks_data[:, 1].tolist() == [payload_size] * num_blocks
+    assert worker._region_is_mla == [True]
 
     metadata = msgspec.msgpack.decode(
         worker.xfer_handshake_metadata.agent_metadata_bytes,
@@ -248,7 +273,59 @@ def test_overlaid_transfer_groups_share_region_geometry():
     )
     assert metadata.region_group_ids == [-1]
     assert metadata.region_num_blocks == [num_blocks]
+    assert metadata.block_lens == [payload_size]
+    assert metadata.block_strides == [block_stride]
     assert worker._block_ids_by_region(([0], [2]), worker.region_group_ids) == [[0, 2]]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("remote_stride", [12672, 16384])
+def test_kpool_tail_transfer_preserves_padding_and_other_blocks(remote_stride):
+    """P/D payload descriptors may have different pitches; padding is not data."""
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
+    from vllm.v1.kv_cache_interface import KpoolTailSpec
+
+    count, local_stride, payload = 1145, 12672, 2048
+    src = torch.full((count + 2, remote_stride), 17, dtype=torch.uint8)
+    dst = torch.full((count + 2, local_stride), 99, dtype=torch.uint8)
+    src_view = src[1 : count + 1, :payload].view(torch.bfloat16).view(count, 2, 4, 128)
+    dst_view = dst[1 : count + 1, :payload].view(torch.bfloat16).view(count, 2, 4, 128)
+    src_base, src_len, src_stride = bw._kpool_tail_region(src_view, count)
+    dst_base, dst_len, dst_stride = bw._kpool_tail_region(dst_view, count)
+    worker = object.__new__(bw.NixlBaseConnectorWorker)
+    worker.transfer_topo = MagicMock()
+    worker.device_id = 0
+    worker.block_len_per_layer = [dst_len]
+    worker.block_stride_per_layer = [dst_stride]
+    worker.region_num_blocks = [count]
+    worker._region_is_mla = [True]
+    worker._group_spec_types = (KpoolTailSpec,)
+    local = worker._build_fa_local([dst_base], 1)
+    remote = worker._build_fa_remote(
+        SimpleNamespace(source_ranks_per_group=((0,),), rank_offset_factor=7),
+        SimpleNamespace(
+            kv_caches_base_addr=[src_base],
+            block_strides=[src_stride],
+            block_lens=[src_len],
+            region_num_blocks=[count],
+            device_id=0,
+        ),
+        1,
+    )
+    expected = dst.clone()
+    for block in (0, 37, count - 1):
+        local_addr, length, _ = map(int, local[block])
+        remote_addr, remote_length, _ = map(int, remote[block])
+        assert length == remote_length == payload
+        dst_offset = local_addr - dst.data_ptr()
+        src_offset = remote_addr - src.data_ptr()
+        dst.flatten()[dst_offset : dst_offset + length].copy_(
+            src.flatten()[src_offset : src_offset + length]
+        )
+        expected[block + 1, :payload] = 17
+    torch.testing.assert_close(dst, expected, rtol=0, atol=0)
 
 
 def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blocks):
