@@ -155,6 +155,10 @@ VLLM_ROCM_GFX1100_GLM53=1 .venv/bin/python -m pytest tests/kernels/moe/test_moe_
 
 ## 当前验证记录
 
+商业运营测试矩阵、建议 SLO 和逐条执行命令见
+[商业运营验收](ACCEPTANCE.md)。自动 HTTP 用例只在显式设置测试地址后访问服务器，
+不自动重启或注入故障。1M 上下文属于尚未完成的独立容量适配目标。
+
 2026-09-14：本地 macOS 独立测试环境完成 `test_rocm_gfx1100.py` 的 CPU 数值和
 配置测试（31 项），包括 EP 非本地专家过滤、top-k、BF16 缓存写入，以及短行和满历史
 情况下的 kpool 尾部保留。该环境使用 CPU Torch 2.14.0；服务器为 ROCm Torch 2.13.0，
