@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
+from vllm.utils import rocm_gfx1100
 from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
@@ -2250,6 +2251,9 @@ def moe_sum(
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
 ):
+    if rocm_gfx1100.enabled(input.device):
+        rocm_gfx1100.moe_sum(input, output, topk_ids, expert_map)
+        return
     torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
 
 
@@ -2815,6 +2819,11 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
+    if rocm_gfx1100.enabled(kv_c.device):
+        rocm_gfx1100.concat_and_cache_mla(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype
+        )
+        return
     torch.ops._C_cache_ops.concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )

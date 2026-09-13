@@ -29,6 +29,7 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils import rocm_gfx1100
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -620,8 +621,10 @@ def per_token_group_quant_fp8(
     # prefer CUDA/XPU kernel if available
     # TODO(bnell): this causes some fp8 moe test to fail.
     if (
-        current_platform.is_cuda_alike() or current_platform.is_xpu()
-    ) and x.is_contiguous():
+        (current_platform.is_cuda_alike() or current_platform.is_xpu())
+        and x.is_contiguous()
+        and not rocm_gfx1100.enabled(x.device)
+    ):
         torch.ops._C.per_token_group_fp8_quant(
             x,
             x_q,

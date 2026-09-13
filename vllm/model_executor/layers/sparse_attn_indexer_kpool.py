@@ -14,6 +14,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.utils import rocm_gfx1100
 
 if TYPE_CHECKING:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
@@ -555,6 +556,10 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+            elif rocm_gfx1100.enabled(logits.device):
+                rocm_gfx1100.topk_prefill(
+                    logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, topk_dst
+                )
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
@@ -830,6 +835,8 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+            elif rocm_gfx1100.enabled(logits.device):
+                rocm_gfx1100.topk_decode(logits, next_n, seq_lens, topk_dst)
             else:
                 torch.ops._C.top_k_per_row_decode(
                     logits,
@@ -1029,6 +1036,19 @@ class SparseAttnIndexerKpool(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
+        if rocm_gfx1100.enabled(hidden_states.device):
+            if index_kpool != 4:
+                raise ValueError("gfx1100 GLM53 requires index_kpool=4")
+            return self.forward_cuda(
+                hidden_states,
+                q_quant,
+                k,
+                weights,
+                gate_score=gate_score,
+                compress_ape=compress_ape,
+                index_kpool=index_kpool,
+                positions=positions,
+            )
         if rocm_aiter_ops.is_enabled():
             if index_kpool <= 1:
                 return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(

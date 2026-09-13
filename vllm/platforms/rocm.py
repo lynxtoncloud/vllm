@@ -874,6 +874,12 @@ class RocmPlatform(Platform):
 
         compilation_config = vllm_config.compilation_config
         model_config = vllm_config.model_config
+        if envs.VLLM_ROCM_GFX1100_GLM53:
+            from vllm.utils.rocm_gfx1100 import configure
+
+            if not on_gfx1100():
+                raise ValueError("VLLM_ROCM_GFX1100_GLM53 requires gfx1100 GPUs")
+            configure(vllm_config)
         if (
             compilation_config.cudagraph_mode is None
             and model_config is not None

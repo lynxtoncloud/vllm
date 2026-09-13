@@ -5,6 +5,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.triton_utils import triton
+from vllm.utils import rocm_gfx1100
 from vllm.utils.math_utils import round_up
 
 
@@ -71,6 +72,15 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    if rocm_gfx1100.enabled(topk_ids.device):
+        return rocm_gfx1100.moe_align(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)

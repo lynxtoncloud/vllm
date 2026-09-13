@@ -33,6 +33,7 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
+from vllm.utils import rocm_gfx1100
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -118,6 +119,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # weights for the view/rearrangement operations.
         if (
             envs.VLLM_ROCM_MOE_PADDING
+            and not rocm_gfx1100.enabled(weight.device)
             and current_platform.is_rocm()
             and not self.moe.moe_parallel_config.enable_eplb
             and weight.stride(-1) == 1
