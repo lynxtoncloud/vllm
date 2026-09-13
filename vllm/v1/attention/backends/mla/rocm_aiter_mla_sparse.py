@@ -477,6 +477,19 @@ class ROCMAiterMLASparseMetadataBuilder(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
 
+        self._prev_req_extent: int = 0
+        self._prev_indices_extent: int = 0
+        self._prev_metadata_key: tuple | None = None
+
+        # Rope-free, unquantized MLA always uses Triton for nonempty batches.
+        # It does not need AITER's persistent decode metadata or its imports.
+        if (
+            not self.kv_cache_dtype.startswith("fp8")
+            and self.mla_dims.qk_rope_head_dim == 0
+        ):
+            self._use_persistent_metadata = False
+            return
+
         # ----- Persistent MLA metadata buffers -----
         # The aiter sparse decode kernel supports a "persistent" path that
         # uses precomputed work-splitting metadata for better load balancing
@@ -538,10 +551,6 @@ class ROCMAiterMLASparseMetadataBuilder(
             dtype=reduce_partial_map_type,
             device=device,
         )
-
-        self._prev_req_extent: int = 0
-        self._prev_indices_extent: int = 0
-        self._prev_metadata_key: tuple | None = None
 
     def _sparse_decode_max_split(self, max_seq_len: int) -> int:
         """Cap ``max_split_per_batch`` for the aiter sparse-MLA decode reduce.

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,45 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     _validate_dsv4_sparse_dims,
     _validate_sparse_dims,
 )
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16"])
+def test_rope_free_metadata_builder_without_aiter(monkeypatch, cache_dtype):
+    """KV-cache initialization must not import AITER for the Triton-only path."""
+    monkeypatch.setitem(sys.modules, "aiter", None)
+    monkeypatch.setattr(current_platform, "num_compute_units", lambda: 96)
+    monkeypatch.setattr(
+        sparse_mod,
+        "get_mla_dims",
+        lambda _: SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=0),
+    )
+    monkeypatch.setattr(
+        sparse_mod.ROCMAiterMLASparseMetadataBuilder,
+        "_init_reorder_batch_threshold",
+        lambda *args, **kwargs: None,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            max_model_len=2048,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            get_num_attention_heads=lambda _: 16,
+        ),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        parallel_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        compilation_config=SimpleNamespace(
+            static_forward_context={"layer": SimpleNamespace(impl=SimpleNamespace())}
+        ),
+    )
+    builder = sparse_mod.ROCMAiterMLASparseMetadataBuilder(
+        SimpleNamespace(block_size=1), ["layer"], config, torch.device("cpu")
+    )
+    assert not builder._use_persistent_metadata
+    assert builder._prev_req_extent == builder._prev_indices_extent == 0
+    assert builder._prev_metadata_key is None
+    assert builder.paged_kv_indices.shape == (4 * 2048,)
+    assert builder.qo_indptr.tolist() == [0, 1, 2, 3, 4]
 
 
 @triton.jit
