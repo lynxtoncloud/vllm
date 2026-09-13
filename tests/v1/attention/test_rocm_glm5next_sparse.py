@@ -22,9 +22,11 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 
 
 @pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16"])
-def test_rope_free_metadata_builder_without_aiter(monkeypatch, cache_dtype):
+@pytest.mark.parametrize("gfx1100", [False, True])
+def test_rope_free_metadata_builder_without_aiter(monkeypatch, cache_dtype, gfx1100):
     """KV-cache initialization must not import AITER for the Triton-only path."""
     monkeypatch.setitem(sys.modules, "aiter", None)
+    monkeypatch.setattr(sparse_mod.rocm_gfx1100, "enabled", lambda: gfx1100)
     monkeypatch.setattr(current_platform, "num_compute_units", lambda: 96)
     monkeypatch.setattr(
         sparse_mod,
@@ -40,7 +42,7 @@ def test_rope_free_metadata_builder_without_aiter(monkeypatch, cache_dtype):
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             max_model_len=2048,
-            hf_text_config=SimpleNamespace(index_topk=2048),
+            hf_text_config=SimpleNamespace(index_topk=2048, index_kpool=4),
             get_num_attention_heads=lambda _: 16,
         ),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
@@ -56,8 +58,74 @@ def test_rope_free_metadata_builder_without_aiter(monkeypatch, cache_dtype):
     assert not builder._use_persistent_metadata
     assert builder._prev_req_extent == builder._prev_indices_extent == 0
     assert builder._prev_metadata_key is None
-    assert builder.paged_kv_indices.shape == (4 * 2048,)
+    assert builder.topk_tokens == (2051 if gfx1100 else 2048)
+    assert builder.paged_kv_indices.shape == (4 * builder.topk_tokens,)
     assert builder.qo_indptr.tolist() == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="Requires ROCm")
+def test_gfx1100_global_indices_preserve_padding_and_partial_tile():
+    """2051-wide kpool rows must neither read past the row nor attend slot zero."""
+    indices = torch.full((2, 2051), -1, dtype=torch.int32, device="cuda")
+    indices[0, :3] = torch.tensor([0, 63, 64], device="cuda")
+    indices[0, 2048:] = torch.tensor([125, 126, 127], device="cuda")
+    indices[1, :3] = torch.tensor([-1, 128, 64], device="cuda")
+    block_table = torch.tensor([[3, 1], [2, -1]], dtype=torch.int32, device="cuda")
+    indptr = torch.tensor([0, 2051, 2054], dtype=torch.int32, device="cuda")
+    out = torch.full((4102,), -99, dtype=torch.int32, device="cuda")
+    sparse_mod.triton_convert_req_index_to_global_index(
+        torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        block_table,
+        indices,
+        indptr,
+        out,
+        BLOCK_SIZE=64,
+        NUM_TOPK_TOKENS=2051,
+        preserve_invalid=True,
+    )
+    expected = torch.full_like(out, -99)
+    expected[:2054] = -1
+    expected[:3] = torch.tensor([192, 255, 64], device="cuda")
+    expected[2048:2051] = torch.tensor([125, 126, 127], device="cuda")
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_gfx1100_forward_keeps_tail_from_aligned_shared_buffer(monkeypatch):
+    """The model's 2176-wide allocation must feed 2051 logical entries to MLA."""
+    monkeypatch.setattr(sparse_mod.rocm_gfx1100, "enabled", lambda *_: True)
+    impl = object.__new__(sparse_mod.ROCMAiterMLASparseImpl)
+    impl.num_heads = 16
+    impl.kv_cache_dtype = "auto"
+    impl.topk_indices_buffer = torch.full((1, 2176), -99, dtype=torch.int32)
+    impl.topk_indices_buffer[0, :2048] = torch.arange(2048)
+    impl.topk_indices_buffer[0, 2048:2051] = torch.tensor([4096, 4097, 4098])
+    original = impl.topk_indices_buffer.clone()
+    captured = {}
+
+    def convert(req, blocks, indices, indptr, output, **kwargs):
+        captured["indices"] = indices
+        assert kwargs["NUM_TOPK_TOKENS"] == 2051
+        assert kwargs["preserve_invalid"]
+
+    monkeypatch.setattr(sparse_mod, "triton_convert_req_index_to_global_index", convert)
+    monkeypatch.setattr(impl, "_forward_mla", lambda layer, q, kv, meta: (q, None))
+    metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        topk_tokens=2051,
+        block_size=64,
+        req_id_per_token=None,
+        block_table=None,
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+    )
+    impl.forward_mqa(
+        torch.zeros((1, 16, 512), dtype=torch.bfloat16),
+        torch.empty(0),
+        metadata,
+        SimpleNamespace(),
+    )
+    torch.testing.assert_close(captured["indices"], original[:, :2051])
+    torch.testing.assert_close(impl.topk_indices_buffer, original)
 
 
 @triton.jit

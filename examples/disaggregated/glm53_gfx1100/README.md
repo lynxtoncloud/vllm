@@ -34,6 +34,10 @@ GPU/PD 验收，再构建新镜像。提交应遵循仓库 AGENTS.md 的署名�
 - FP8 分组量化使用已有 Triton fallback，避开发生过段错误的编译算子。
   BF16 模型的索引器仍使用 FP8 数据，这不等于开启 FP8 模型权重量化。
 - 当前上游已有 rope-free 稀疏 MLA 路径，入口也已取消 gfx950 限制；无需旧镜像的导入补丁。
+- rope-free MLA 的 KV 元数据初始化不加载 AITER；索引就绪接口在同一 stream 下为无操作。
+- gfx1100 稀疏 MLA 保留 2048 个历史 token 和最多 3 个未满池尾部 token，
+  压紧有效索引后使用最多 2051 宽度的 Triton 路径。负索引和越界页保持无效，
+  不会变成对缓存第 0 格的注意力。该修改不扩展 FP8 权重支持。
 
 没有移植旧 FP8 权重实验的 GEMM 补丁。新增 native/HIP 算子如果再次失败，要依据新栈定位。
 
@@ -67,11 +71,11 @@ docker save "$GFX1100_IMAGE" -o /data/services/glm53-gfx1100.tar
 ## 四节点启动
 
 | 角色 | IP | TP ranks | API | rendezvous | NIXL side channel |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | P0 | 10.5.10.36 | 0–7 | 8001 | .36:29501 | .36:5557 |
-| P1 | 10.5.10.3 | 8–15 | headless | .36:29501 | .3:5557 |
+| P1 | 10.5.10.3 | 8–15 | headless | .36:29501 | 通过 P0 交换元数据 |
 | D0 | 10.5.10.55 | 0–7 | 8002 | .55:29502 | .55:5657 |
-| D1 | 10.5.10.56 | 8–15 | headless | .55:29502 | .56:5657 |
+| D1 | 10.5.10.56 | 8–15 | headless | .55:29502 | 通过 D0 交换元数据 |
 
 这是一个跨两节点的 P 引擎和一个跨两节点的 D 引擎。各自 TP16/EP，节点各 8 张卡。
 不是四个独立 API 实例。容器使用 host network，网卡名称必须使用各宿主机实际接口。
@@ -119,7 +123,7 @@ IFACE_NAME=bond0 bash examples/disaggregated/glm53_gfx1100/launch-node.sh p0 --d
 .venv/bin/python -m pytest --confcutdir=tests/standalone_tests tests/standalone_tests/test_rocm_gfx1100.py -q
 ```
 
-2. ROCm 构建/测试环境完成 vLLM 可编辑安装后，用同一测试文件验证 GPU：
+1. ROCm 构建/测试环境完成 vLLM 可编辑安装后，用同一测试文件验证 GPU：
 
 ```bash
 GFX1100_TEST_DEVICE=cuda .venv/bin/python -m pytest --confcutdir=tests/standalone_tests tests/standalone_tests/test_rocm_gfx1100.py -q
@@ -127,7 +131,7 @@ VLLM_ROCM_GFX1100_GLM53=1 .venv/bin/python -m pytest tests/kernels/moe/test_moe_
 .venv/bin/python -m pytest tests/v1/attention/test_rocm_glm5next_sparse.py -q
 ```
 
-3. P0 与 D0 `/health` 均返回 200 后，通过上游 NIXL 集成测试代理验证真实传输。
+1. P0 与 D0 `/health` 均返回 200 后，通过上游 NIXL 集成测试代理验证真实传输。
 在可访问四节点的、已经安装 vLLM 及测试依赖的环境中，从本仓库执行：
 
 ```bash
@@ -138,7 +142,7 @@ VLLM_ROCM_GFX1100_GLM53=1 .venv/bin/python -m pytest tests/kernels/moe/test_moe_
 确认 P 端产生 `kv_transfer_params`、D 端成功加载远端缓存，没有本地重算掩盖失败。
 检查 NIXL 传输日志/指标以及实际输出；请求成功不能单独证明缓存传输成功。
 
-4. 对固定提示、temperature=0，对比同 checkpoint 非 PD 基线的输出/token/logprob。
+1. 对固定提示、temperature=0，对比同 checkpoint 非 PD 基线的输出/token/logprob。
 覆盖短提示、跨 kpool=4 边界、跨 KV block 边界、接近 8192 的长度、重复提示和多轮对话。
 图像/视频也需要独立验收，当前未关闭视觉输入，但没有完成视觉端到端验证。
 保留日志、GPU/CPU 峰值内存、首 token 延迟及 decode 吞吐，再评估扩大长度和并发。
@@ -148,7 +152,19 @@ VLLM_ROCM_GFX1100_GLM53=1 .venv/bin/python -m pytest tests/kernels/moe/test_moe_
 
 ## 当前验证记录
 
-本地仅完成静态语法、Ruff 和四角色启动参数检查。此前尝试的 CPU pytest 因本地缺少
-vLLM 导入依赖而未完成，未得到运行时测试通过的结论。GPU/模型/PD 测试均未执行。
-完整 pre-commit 在默认源和清华源两次尝试中均阻塞于钩子依赖安装，已中断；
-本次提交未运行完整钩子集，服务器或 CI 仍需补跑 `pre-commit run --all-files`。
+2026-09-14：本地 macOS 独立测试环境完成 `test_rocm_gfx1100.py` 的 CPU 数值和
+配置测试（31 项），包括 EP 非本地专家过滤、top-k、BF16 缓存写入，以及短行和满历史
+情况下的 kpool 尾部保留。该环境使用 CPU Torch 2.14.0；服务器为 ROCm Torch 2.13.0，
+不能用本地通过代替 GPU 验证。新增 ROCm 回归用例覆盖 2051 宽度的分页映射和无效索引。
+另外用隔离方法调用完成 metadata 初始化及 2176 对齐缓冲区到 2051 逻辑索引的
+5 项 CPU 检查；未运行整个 attention 测试文件。修改文件的全部适用 pre-commit 钩子通过，
+包括 Ruff、mypy 和 Markdown 检查。
+
+链路审查包含 BF16 投影/MoE/MHC、KDA 卷积与递归状态、索引缓存和尾部缓存、
+稀疏 MLA prefill/decode、NIXL 分组注册及 P/D 状态交接。与固定的 NIXL 1.4.0 源码
+核对了 connector 调用的 16 个 Python 方法，均存在；这只证明方法存在，不证明传输成功。
+
+服务器已报告四节点模块加载和 UCX agent 初始化通过，尚未完成四节点模型推理或
+真实 P/D 缓存传输验收。RDMA 显存注册仍有已知失败，初次部署沿用 TCP/ROCm transport。
+主机原生安装、日志和逐条启动命令由外层项目的 `deployment/` 文档管理；
+本目录的 Docker 命令是另外一种构建方式，不要混用容器与原生环境。

@@ -95,6 +95,27 @@ def test_decode_topk_causal_lengths(lens, ends):
         assert (output[row, count:] == -1).all()
 
 
+@pytest.mark.parametrize("seq_len", [0, 1, 3, 4, 2047, 2048, 2049, 2051, 4096, 8191])
+def test_kpool_compaction_preserves_full_history_and_incomplete_tail(seq_len):
+    """Attention must retain up to 2048 history tokens AND the 0..3 live tail."""
+    history_count = min(seq_len // 4, 512) * 4
+    # Descending history also catches accidental reordering of top-k output.
+    history = torch.arange(history_count, device=DEVICE).flip(0)
+    tail = torch.arange(seq_len // 4 * 4, seq_len, device=DEVICE)
+    indices = torch.full((1, 2051), -1, dtype=torch.int32, device=DEVICE)
+    indices[0, :history_count] = history
+    indices[0, 2048 : 2048 + tail.numel()] = tail
+    original = indices.clone()
+    packed = fallback.compact_sparse_indices(indices)
+    expected = torch.cat((history, tail)).to(torch.int32)
+    torch.testing.assert_close(packed[0, : expected.numel()], expected)
+    assert (packed[0, expected.numel() :] == -1).all()
+    torch.testing.assert_close(indices, original)
+    # The metadata may reserve up to 3 extra positions; all must stay masked.
+    ragged_row = packed[0, : min(seq_len, 2051)]
+    torch.testing.assert_close(ragged_row[ragged_row >= 0], expected)
+
+
 @pytest.mark.parametrize("rope", [0, 2])
 def test_mla_cache_slots_zero_rope_and_noncontiguous_cache(rope):
     kv = torch.arange(20, device=DEVICE).reshape(5, 4).bfloat16()
@@ -115,7 +136,9 @@ def test_mla_cache_slots_zero_rope_and_noncontiguous_cache(rope):
 def config():
     return NS(
         model_config=NS(
-            hf_text_config=NS(model_type="glm5_next_text", qk_rope_head_dim=0),
+            hf_text_config=NS(
+                model_type="glm5_next_text", qk_rope_head_dim=0, index_kpool=4
+            ),
             dtype=torch.bfloat16,
             quantization=None,
             enforce_eager=True,
@@ -154,6 +177,13 @@ def test_profile_rejects_unvalidated_config(section, field, value):
     cfg = config()
     setattr(getattr(cfg, section), field, value)
     with pytest.raises(ValueError):
+        fallback.configure(cfg)
+
+
+def test_profile_rejects_unsupported_pool_before_loading_weights():
+    cfg = config()
+    cfg.model_config.hf_text_config.index_kpool = 16
+    with pytest.raises(ValueError, match="index_kpool=4"):
         fallback.configure(cfg)
 
 

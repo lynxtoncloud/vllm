@@ -20,6 +20,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils import rocm_gfx1100
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import np_to_pinned_tensor
 from vllm.v1.attention.backend import (
@@ -106,6 +107,8 @@ def _convert_req_index_to_global_index_kernel(
     max_num_blocks_per_req: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
+    NUM_TOPK_TOKENS: tl.constexpr,
+    PRESERVE_INVALID: tl.constexpr,
     # strides (in elements)
     bt_stride0,
     bt_stride1,
@@ -132,9 +135,8 @@ def _convert_req_index_to_global_index_kernel(
 
     # Load token indices for this tile
     ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-    tok = tl.load(ti_ptr)  # int32
+    tok = tl.load(ti_ptr, mask=indice_id < NUM_TOPK_TOKENS, other=-1)
 
-    # Only token == -1 should propagate as -1
     is_invalid_tok = tok < 0
 
     # Compute block id and in-block offset
@@ -146,12 +148,19 @@ def _convert_req_index_to_global_index_kernel(
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     base = tl.load(bt_ptr, mask=valid_block, other=0)
 
-    # # If token == -1 OR block_id OOB, output 0; else base * BLOCK_SIZE + offset
+    # AITER uses slot zero padding; Triton masks negative indices instead.
+    invalid = is_invalid_tok | (~valid_block)
+    if PRESERVE_INVALID:
+        invalid = invalid | (base < 0)
     out_val = tl.where(
-        is_invalid_tok | (~valid_block), 0, base * BLOCK_SIZE + inblock_off
+        invalid,
+        -1 if PRESERVE_INVALID else 0,
+        base * BLOCK_SIZE + inblock_off,
     )
     out_ptr_ij = out_ptr + seq_start + indice_id
-    out_ptr_ij_mask = (seq_start + indice_id) < seq_end
+    out_ptr_ij_mask = ((seq_start + indice_id) < seq_end) & (
+        indice_id < NUM_TOPK_TOKENS
+    )
 
     # store the results with mask
     tl.store(out_ptr_ij, out_val, mask=out_ptr_ij_mask)
@@ -166,6 +175,7 @@ def triton_convert_req_index_to_global_index(
     BLOCK_SIZE: int = 64,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
+    preserve_invalid: bool = False,
 ):
     """
     out[token_id, indice_id] =
@@ -173,21 +183,17 @@ def triton_convert_req_index_to_global_index(
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    Invalid tokens and out-of-bounds blocks become -1 when preserve_invalid
+    is enabled for Triton, or slot zero for the legacy AITER path.
     """
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible byBLOCK_N ({BLOCK_N})"
-    )
     # print("req_id: ", req_id, flush=True)
     num_tokens = req_id.shape[0]
     _, max_num_blocks_per_req = block_table.shape
-    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+    tiles_per_row = triton.cdiv(NUM_TOPK_TOKENS, BLOCK_N)
 
     # Ensure contiguous tensors on the same device
     req_id_c = req_id.contiguous()
@@ -211,6 +217,8 @@ def triton_convert_req_index_to_global_index(
         max_num_blocks_per_req,
         BLOCK_SIZE,
         BLOCK_N,
+        NUM_TOPK_TOKENS,
+        preserve_invalid,
         # strides
         bt_stride0,
         bt_stride1,
@@ -436,6 +444,10 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_text_config.index_topk
+        if rocm_gfx1100.enabled():
+            # The BF16 Triton path accepts all history tokens plus the live
+            # incomplete pool, unlike AITER's fixed-width top-k interface.
+            self.topk_tokens += self.model_config.hf_text_config.index_kpool - 1
         attention_context = vllm_config.compilation_config.static_forward_context
         # Sink decode must use AITER's nonpersistent path. In particular,
         # gfx942 has no persistent+LSE kernel, and its metadata heuristic
@@ -615,6 +627,8 @@ class ROCMAiterMLASparseMetadataBuilder(
             num_tokens,
             common_attn_metadata.max_query_len,
         )
+        # gfx1100 reserves history + up to 3 tail entries. After compaction,
+        # any unused reservation remains -1 and is masked by Triton attention.
 
         torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
         self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
@@ -1057,9 +1071,15 @@ class ROCMAiterMLASparseImpl(
 
         # Get topk indices
         assert self.topk_indices_buffer is not None
-        topk_indices = fit_kpool_indices_to_aiter(
-            self.topk_indices_buffer[:num_actual_toks], attn_metadata.topk_tokens
-        )
+        preserve_kpool_tail = rocm_gfx1100.enabled(q.device)
+        if preserve_kpool_tail:
+            topk_indices = rocm_gfx1100.compact_sparse_indices(
+                self.topk_indices_buffer[:num_actual_toks, : attn_metadata.topk_tokens]
+            )
+        else:
+            topk_indices = fit_kpool_indices_to_aiter(
+                self.topk_indices_buffer[:num_actual_toks], attn_metadata.topk_tokens
+            )
 
         triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
@@ -1069,6 +1089,7 @@ class ROCMAiterMLASparseImpl(
             attn_metadata.paged_kv_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            preserve_invalid=preserve_kpool_tail,
         )
 
         # write the latent and rope to kv cache

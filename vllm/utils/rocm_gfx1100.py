@@ -56,6 +56,8 @@ def configure(config: "VllmConfig") -> None:
         raise ValueError("gfx1100 GLM53 requires an unquantized BF16 KV cache")
     if getattr(text, "qk_rope_head_dim", None) != 0:
         raise ValueError("gfx1100 GLM53 requires rope-free MLA")
+    if getattr(text, "index_kpool", None) != 4:
+        raise ValueError("gfx1100 GLM53 requires index_kpool=4")
     kernel = config.kernel_config
     if kernel.moe_backend not in ("auto", "triton"):
         raise ValueError("gfx1100 GLM53 requires the Triton MoE backend")
@@ -192,6 +194,21 @@ def topk_decode(
         ends = lens.clamp_min(0)
     ends = ends.reshape(-1)
     topk_prefill(logits, torch.zeros_like(ends), ends, output)
+
+
+def compact_sparse_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Keep every selected history/tail token before the -1 padding.
+
+    Kpool appends its incomplete pool after the fixed history region. Packing
+    valid entries lets short ragged rows include that tail without dropping
+    history tokens when the history region is full.
+    """
+    assert indices.ndim == 2 and indices.dtype in (torch.int32, torch.int64)
+    valid = indices >= 0
+    positions = (valid.cumsum(dim=1) - 1).clamp_min(0)
+    packed = torch.zeros_like(indices)
+    packed.scatter_add_(1, positions, torch.where(valid, indices + 1, 0))
+    return packed - 1
 
 
 def concat_and_cache_mla(
