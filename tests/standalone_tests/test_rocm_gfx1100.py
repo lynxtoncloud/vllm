@@ -7,8 +7,11 @@ the model/GPU fixtures in tests/conftest.py. They also run unchanged on ROCm
 with GFX1100_TEST_DEVICE=cuda for numerical GPU validation.
 """
 
+import ast
 import os
+from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,6 +19,68 @@ import torch
 from vllm.utils import rocm_gfx1100 as fallback
 
 DEVICE = os.getenv("GFX1100_TEST_DEVICE", "cpu")
+
+
+@pytest.mark.parametrize("has_tilelang_mhc", [False, True])
+@pytest.mark.parametrize("enable_warmup", [False, True])
+def test_glm_mhc_warmup_skips_unselected_tilelang(has_tilelang_mhc, enable_warmup):
+    """Execute the real registration block without loading the GPU model.
+
+    gfx1100 uses Torch/Triton MHC. Registering the unused ROCm TileLang
+    wrappers makes startup try to call compile() on a plain function.
+    """
+    path = Path(__file__).parents[2] / "vllm/models/glm5next/nvidia/model.py"
+    tree = ast.parse(path.read_text())
+    blocks: list[ast.stmt] = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(stmt, ast.ImportFrom)
+            and stmt.module == "vllm.model_executor.kernels.mhc.tilelang_kernels"
+            for stmt in node.body
+        )
+    ]
+    assert len(blocks) == 1
+    kernels = NS(
+        **{
+            name: NS(register_warmup=Mock())
+            for name in (
+                "_HC_PRENORM_GEMM_TILELANG_KERNEL",
+                "_MHC_FUSED_TILELANG_KERNEL",
+                "_MHC_POST_TILELANG_KERNEL",
+                "_MHC_PRE_BIG_FUSE_TILELANG_KERNEL",
+            )
+        }
+    )
+    imports = Mock(
+        side_effect=lambda name, *args: (
+            kernels
+            if name.endswith("tilelang_kernels")
+            else NS(is_deep_gemm_supported=lambda: False)
+        )
+    )
+    namespace = dict(
+        __builtins__={"__import__": imports},
+        HAS_TILELANG_MHC=has_tilelang_mhc,
+        vllm_config=NS(kernel_config=NS(enable_jit_warmup=enable_warmup)),
+        self=NS(
+            hidden_size=4096,
+            n=4,
+            rms_norm_eps=1e-6,
+            hc_eps=1e-6,
+            mhc_post_mult_value=2.0,
+            mhc_sinkhorn_iterations=20,
+            input_layernorm=NS(variance_epsilon=1e-6),
+            post_attention_layernorm=NS(variance_epsilon=1e-6),
+        ),
+    )
+    exec(
+        compile(ast.Module(body=blocks, type_ignores=[]), str(path), "exec"), namespace
+    )
+    expected = int(has_tilelang_mhc and enable_warmup)
+    assert imports.call_count == 2 * expected
+    assert all(k.register_warmup.call_count == expected for k in vars(kernels).values())
 
 
 @pytest.mark.parametrize("ignore", [False, True])

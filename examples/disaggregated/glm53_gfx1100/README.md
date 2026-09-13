@@ -177,3 +177,14 @@ VLLM_ROCM_GFX1100_GLM53=1 .venv/bin/python -m pytest tests/kernels/moe/test_moe_
 每块有效数据 2048 字节、块间距 12672 字节。已补充这一精确几何的注册回归，
 以及 P/D 块间距不同情况下的描述符拷贝检查，验证 padding 和其他块不被覆盖。
 这些是 CPU 描述符/内存模拟检查，不是实际 UCX/GPU 网络传输验收。
+
+服务器随后在 `compile_or_warm_up_model` 报告
+`'function' object has no attribute 'compile'`。GLM decoder 构造时此前无条件按
+`enable_jit_warmup` 注册 TileLang MHC，而 gfx1100 运行时已选择 Torch/Triton MHC。
+ROCm 的延迟 `tilelang_jit` 装饰器返回普通函数，没有 `.compile()`，因此未使用的
+TileLang 预热仍会使启动失败。现将这四组注册与运行时 `HAS_TILELANG_MHC` 条件统一；
+KDA 的 Triton 状态散布预热保留，也不关闭全局 JIT 预热。
+
+新增测试隔离执行模型源码的注册块，覆盖 TileLang 可用性与 JIT 预热开关的四种组合。
+旧条件在“不使用 TileLang 但开启预热”时失败；修复后独立 CPU 测试共 35 项通过。
+这未执行真实 TileLang/GPU 编译或多节点启动，服务器仍需按原命令重启验收。
