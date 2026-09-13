@@ -4,10 +4,6 @@
 eager、最大长度 8192、并发 1、无推测解码。不是百万上下文或生产性能承诺。
 CPU 测试不能证明 GPU/PD 正确性；完成下方验收后才能扩大范围。
 
-四台机器从 SSH 登录到安装、分发、启动、验收，请按
-[统一标准安装手册](INSTALL.md)执行。源码统一在 `/data/vllm`，模型、缓存、日志和
-发布文件统一放在 `/data` 下；本页保留适配原理和开发工作流。
-
 ## 分支与上游
 
 `main` 只同步上游；`gfx1100/glm53-bf16-pd` 保存适配。`origin` 是自己的 fork，
@@ -101,9 +97,8 @@ bash examples/disaggregated/glm53_gfx1100/launch-node.sh d1
 ```
 
 P0 启动后立即启动 P1，D0 启动后立即启动 D1，不要等主节点就绪才启动从节点。
-启动命令前可设置 `IMAGE`、`MODEL_DIR`、`IFACE_NAME`、`CONTAINER_NAME`、`LOG_DIR`、`HF_CACHE_DIR`。
+启动命令前可设置 `IMAGE`、`MODEL_DIR`、`IFACE_NAME`、`CONTAINER_NAME`、`LOG_DIR`。
 默认模型路径 `/data/models/zai-org/GLM-5.3-Flash-BF16`；日志 `/data/logs/glm53-src-角色/latest.log`。
-Hugging Face 缓存默认在 `/data/cache/huggingface`。
 脚本可复制到 `/data/services`，运行不依赖源码工作目录。
 它是前台 Docker + tee，保留终端或使用 tmux。退出后检查容器状态；重跑前自行检查并删除
 已经停止的同名容器。停止某节点请用 `docker stop --time 30 glm53-src-p0` 等精确容器名。

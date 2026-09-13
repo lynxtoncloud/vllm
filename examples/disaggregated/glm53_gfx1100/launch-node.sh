@@ -17,23 +17,22 @@ image=${IMAGE:-local/vllm:glm53-gfx1100}
 model_dir=${MODEL_DIR:-/data/models/zai-org/GLM-5.3-Flash-BF16}
 name=${CONTAINER_NAME:-glm53-src-$role}
 log_dir=${LOG_DIR:-/data/logs/glm53-src-$role}
-hf_cache_dir=${HF_CACHE_DIR:-/data/cache/huggingface}
 iface=${IFACE_NAME:-}
 if [[ -z "$iface" ]]; then
   iface=$(ip -o -4 addr show | awk -v target="$node_ip" 'split($4,a,"/") && a[1]==target {sub(/@.*/,"",$2); print $2; exit}')
 fi
 : "${iface:?Set IFACE_NAME to the interface owning the node IP}"
-cmd=(docker run --init --name "$name" --network host --ipc host
-  --ulimit memlock=-1:-1)
+rdma_devices=()
 if [[ -d /dev/infiniband ]]; then
-  cmd+=(--device /dev/infiniband)
+  rdma_devices=(--device /dev/infiniband)
 fi
-cmd+=(
+cmd=(docker run --init --name "$name" --network host --ipc host
+  --ulimit memlock=-1:-1 "${rdma_devices[@]}"
   --device /dev/kfd --device /dev/dri --group-add video
   --security-opt seccomp=unconfined
   --mount "type=bind,src=$model_dir,dst=/models/GLM-5.3-Flash-BF16,readonly"
   --mount "type=bind,src=$log_dir,dst=/app/logs"
-  --mount "type=bind,src=$hf_cache_dir,dst=/root/.cache/huggingface"
+  --mount "type=bind,src=$HOME/.cache/huggingface,dst=/root/.cache/huggingface"
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
   -e VLLM_ROCM_GFX1100_GLM53=1
   -e VLLM_ROCM_USE_AITER=0 -e VLLM_ROCM_USE_AITER_MOE=0
@@ -76,7 +75,7 @@ if docker container inspect "$name" >/dev/null 2>&1; then
   echo "Container $name already exists; inspect/stop it before a new run." >&2
   exit 1
 fi
-mkdir -p "$log_dir" "$hf_cache_dir"
+mkdir -p "$log_dir" "$HOME/.cache/huggingface"
 log_file="$log_dir/$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 ln -sfn "$(basename "$log_file")" "$log_dir/latest.log"
 "${cmd[@]}" 2>&1 | tee "$log_file"
