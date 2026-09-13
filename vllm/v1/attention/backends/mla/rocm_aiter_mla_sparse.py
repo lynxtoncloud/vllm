@@ -809,6 +809,11 @@ class ROCMAiterMLASparseImpl(
             (q_concat_shape, vllm_config.model_config.dtype),
         )
 
+    def record_logical_topk_ready(self) -> None:
+        # ROCm consumes the indices on the producing stream and does not use
+        # SparseMLAIndexGroup's side-stream conversion or readiness event.
+        pass
+
     def _forward_mla(
         self,
         layer: AttentionLayer,
