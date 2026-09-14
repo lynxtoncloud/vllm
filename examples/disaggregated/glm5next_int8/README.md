@@ -224,6 +224,11 @@ reusing the long text prefix cache across test requests. These synthetic
 retrieval/color cases verify the execution path; they are not a general model
 quality benchmark or a combined 1M-text-plus-video capacity test.
 
+Both text and media requests use `reasoning_effort="low"`. The checkpoint
+template ignores `enable_thinking`, defaults to Max effort, and always opens
+`<think>` for generation. Low effort still allows reasoning, which consumes
+the output token budget; it does not disable thinking.
+
 Each functional case requires a complete streaming response, token usage,
 the expected answer, increasing decoder NIXL byte/count metrics, and unchanged
 transfer/notification failure counters. Raw P/D metrics are saved before and

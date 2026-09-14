@@ -26,7 +26,13 @@ spec.loader.exec_module(checks)
 
 class CharacterTokenizer:
     def apply_chat_template(self, messages, **kwargs):
-        return "<user>" + messages[0]["content"] + "</user><assistant>"
+        # The checkpoint ignores enable_thinking and defaults to Max effort.
+        effort = kwargs.get("reasoning_effort", "max").capitalize()
+        return (
+            f"<system>Reasoning Effort: {effort}<user>"
+            + messages[0]["content"]
+            + "</user><assistant>"
+        )
 
     def encode(self, text, **kwargs):
         return list(map(ord, text))
@@ -39,6 +45,7 @@ def test_retrieval_budget_preserves_all_needles_and_generation_suffix(length):
     assert len(ids) == length
     assert length % 4 != 0  # Exercise kpool's partial final pool.
     assert text.endswith("</user><assistant>")
+    assert text.startswith("<system>Reasoning Effort: Low<user>")
     positions = [text.index(expected[k]) for k in ("start", "middle", "end")]
     assert positions[0] < length * 0.3
     assert length * 0.3 < positions[1] < length * 0.7
@@ -236,6 +243,7 @@ def test_full_client_workflow_with_mock_http_and_performance_gate(
             }
             inputs = len(payload["prompt"])
         else:
+            assert payload["reasoning_effort"] == "low"
             question = payload["messages"][0]["content"][0]["text"]
             inputs = 100
             if "two image" in question:

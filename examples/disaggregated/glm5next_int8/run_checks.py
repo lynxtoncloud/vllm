@@ -46,7 +46,7 @@ def long_prompt(tokenizer, length, nonce):
         [{"role": "user", "content": marker}],
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False,
+        reasoning_effort="low",
     )
     prefix, suffix = template.split(marker)
     expected = {key: f"{nonce}-{key}" for key in ("start", "middle", "end")}
@@ -392,7 +392,7 @@ async def run(args):
                         )
                         payload.update(
                             messages=messages,
-                            chat_template_kwargs={"enable_thinking": False},
+                            reasoning_effort="low",
                         )
                         endpoint = "/v1/chat/completions"
                     if args.mode == "perf":
