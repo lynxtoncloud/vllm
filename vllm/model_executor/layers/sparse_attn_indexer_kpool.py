@@ -1029,24 +1029,9 @@ class SparseAttnIndexerKpool(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if rocm_aiter_ops.is_enabled():
-            if index_kpool <= 1:
-                return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
-                    hidden_states,
-                    _encode_layer_name(self.k_cache.prefix),
-                    self.k_cache.kv_cache,
-                    q_quant,
-                    k,
-                    weights,
-                    self.quant_block_size,
-                    self.scale_fmt,
-                    self.topk_tokens,
-                    self.head_dim,
-                    self.max_model_len,
-                    self.max_total_seq_len,
-                    self.topk_indices_buffer,
-                    skip_k_cache_insert=self.skip_k_cache_insert,
-                )
+        # The shared kpool path selects ROCm kernels and has non-AITER logits
+        # implementations. Only the unpooled operator requires AITER here.
+        if index_kpool > 1:
             return self.forward_cuda(
                 hidden_states,
                 q_quant,
@@ -1056,6 +1041,23 @@ class SparseAttnIndexerKpool(CustomOp):
                 compress_ape=compress_ape,
                 index_kpool=index_kpool,
                 positions=positions,
+            )
+        if rocm_aiter_ops.is_enabled():
+            return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
+                hidden_states,
+                _encode_layer_name(self.k_cache.prefix),
+                self.k_cache.kv_cache,
+                q_quant,
+                k,
+                weights,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                self.topk_indices_buffer,
+                skip_k_cache_insert=self.skip_k_cache_insert,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

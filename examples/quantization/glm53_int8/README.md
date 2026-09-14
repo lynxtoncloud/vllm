@@ -33,6 +33,9 @@ The converter preserves the tokenizer, processors, templates and vision weights.
   INT32 storage directly. It forms BF16/FP16 operands with FP32 accumulation
   without keeping a complete dequantized MLP weight copy. CUDA and other
   platforms retain their existing backend selection and support checks.
+- The ROCm kpool indexer reaches the shared implementation even when AITER is
+  disabled. Its existing ROCm logits implementations select their own backend;
+  the AITER requirement remains on the unpooled indexer operator.
 
 The change adds no custom MoE routing, cache, MHC, sparse-attention or NIXL
 fallbacks. It does not override eager/graph mode, speculative decoding,
@@ -67,10 +70,11 @@ No extra gfx1100 profile or forced MoE backend is needed by this adaptation.
 .venv/bin/python -m pytest tests/kernels/moe/test_moe.py -k fused_moe_wn16 -q
 ```
 
-On the local Mac, 93 standalone CPU tests pass. They execute the actual model
+On the local Mac, 97 standalone CPU tests pass. They execute the actual model
 loading functions in isolation, covering format detection, packed-byte decoding,
 BF16/FP16 destinations, projection shard routing, incomplete weight errors,
-and MTP checkpoint-name rewriting. They do not instantiate the full model.
+MTP checkpoint-name rewriting, and pooled/unpooled ROCm dispatch with AITER
+enabled or disabled. They do not instantiate the full model.
 
 The full compressed-tensors and MoE suites require a complete vLLM runtime.
 The new GPU GEMM tests require ROCm and cover row/column TP, separate gate/up

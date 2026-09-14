@@ -38,6 +38,63 @@ def _model_functions():
 helpers = _model_functions()
 
 
+@pytest.mark.parametrize("index_kpool", [1, 4])
+@pytest.mark.parametrize("aiter_enabled", [False, True])
+def test_rocm_kpool_dispatch_does_not_require_aiter(index_kpool, aiter_enabled):
+    """The pooled indexer must reach profiling/fallbacks with AITER disabled."""
+    path = Path(__file__).parents[2] / (
+        "vllm/model_executor/layers/sparse_attn_indexer_kpool.py"
+    )
+    method = next(
+        node
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+    )
+    native = Mock(return_value="native")
+    enabled = Mock(return_value=aiter_enabled)
+    namespace: dict = dict(
+        torch=NS(
+            Tensor=torch.Tensor, ops=NS(vllm=NS(rocm_aiter_sparse_attn_indexer=native))
+        ),
+        rocm_aiter_ops=NS(is_enabled=enabled),
+        _encode_layer_name=lambda name: name,
+    )
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    shared = Mock(return_value="pooled")
+    instance = NS(
+        use_fp4_cache=False,
+        forward_cuda=shared,
+        k_cache=NS(prefix="indexer", kv_cache=None),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=32768,
+        max_total_seq_len=32768,
+        topk_indices_buffer=None,
+        skip_k_cache_insert=False,
+    )
+    x = torch.empty(0)
+    kwargs = dict(gate_score=x, compress_ape=x, index_kpool=index_kpool, positions=x)
+    if index_kpool > 1:
+        assert namespace["forward_hip"](instance, x, x, x, x, **kwargs) == "pooled"
+        shared.assert_called_once_with(x, x, x, x, **kwargs)
+        enabled.assert_not_called()
+        native.assert_not_called()
+    elif aiter_enabled:
+        assert namespace["forward_hip"](instance, x, x, x, x, **kwargs) == "native"
+        native.assert_called_once()
+        shared.assert_not_called()
+    else:
+        with pytest.raises(RuntimeError, match="only supported on AITER"):
+            namespace["forward_hip"](instance, x, x, x, x, **kwargs)
+        shared.assert_not_called()
+        native.assert_not_called()
+
+
 def w8a16_config():
     return NS(
         get_name=lambda: "compressed-tensors",
