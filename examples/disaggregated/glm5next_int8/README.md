@@ -344,6 +344,16 @@ use; buffers and forwards without attention metadata are skipped. It does not
 inspect every internal fused operation or prove cache correctness. A module's
 output failure narrows the boundary; it does not by itself identify the kernel
 or rank that originally produced bad data before a collective.
+MoERunner diagnostics also check routed parameters and bracket expert selection,
+modular expert execution, routed scaling and the runner's reduction methods.
+For Triton WNA16 experts it additionally checks GEMM1, activation, GEMM2 and
+local top-k summation, without inspecting unwritten output workspaces.
+An `input` failure at a reduction means bad data arrived before that call;
+an `output` failure with finite input needs results from all ranks to distinguish
+another rank's bad contribution, overflow and a communication implementation bug.
+The new runner's scheduler-based kernel warmup has attention metadata and is
+checked too. It uses synthetic token IDs and real prefill/decode execution:
+a failure there must be labeled as warmup, not an actual client request.
 The checks synchronize GPU work and may change timing, so use short fresh
 prompts for diagnosis, not the performance suite. The switch defaults off and
 does not replace or sanitize values. Disable it before performance testing.

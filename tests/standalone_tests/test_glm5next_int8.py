@@ -91,6 +91,90 @@ def test_finite_diagnostics_reject_graph_mode_before_installing_hooks():
     assert not model._forward_hooks and not model._forward_pre_hooks
 
 
+@pytest.mark.parametrize(
+    "fault,location",
+    [
+        ("parameter", "routed_experts parameter=scale"),
+        ("router", "router stage=select_experts output"),
+        ("experts", "routed_experts stage=forward_modular output"),
+        ("gemm1", "stage=gemm1 output"),
+        ("activation", "stage=activation output"),
+        ("gemm2", "stage=gemm2 output"),
+        ("moe_sum", "stage=moe_sum output"),
+        ("before_reduce", "stage=_maybe_reduce_final_output input"),
+        ("reduce", "stage=_maybe_reduce_final_output output"),
+        (None, None),
+    ],
+)
+def test_finite_moe_diagnostics_separate_local_computation_and_reduction(
+    fault, location
+):
+    class TritonWNA16Experts:
+        def activation(self, activation, output, input):
+            output.copy_(input)
+            if fault == "activation":
+                output.fill_(float("nan"))
+
+        def moe_sum(self, input, output):
+            output.copy_(input)
+            if fault == "moe_sum":
+                output.fill_(float("inf"))
+
+    class Routed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            value = float("nan") if fault == "parameter" else 1.0
+            self.scale = torch.nn.Parameter(torch.tensor(value))
+            self.quant_method = NS(moe_kernel=NS(fused_experts=TritonWNA16Experts()))
+
+        def forward_modular(self, *, x, **kwargs):
+            if fault == "experts":
+                return x / 0
+            experts = self.quant_method.moe_kernel.fused_experts
+            gemm1 = x / 0 if fault == "gemm1" else x * self.scale
+            # In-place outputs are undefined until their producer has run.
+            activated = torch.full_like(x, float("nan"))
+            experts.activation(None, activated, gemm1)
+            gemm2 = activated / 0 if fault == "gemm2" else activated
+            output = torch.full_like(x, float("nan"))
+            experts.moe_sum(gemm2, output)
+            return output
+
+    class Runner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.routed_experts = Routed()
+            weight = float("nan") if fault == "router" else 1.0
+            self.router = NS(
+                select_experts=lambda: (torch.tensor([weight]), torch.tensor([0]))
+            )
+
+        def _apply_quant_method(self, x):
+            weights, ids = self.router.select_experts()
+            return None, self.routed_experts.forward_modular(
+                x=x, topk_weights=weights, topk_ids=ids
+            )
+
+        def _maybe_reduce_final_output(self, x):
+            return x / 0 if fault == "reduce" else x * 2
+
+        def forward(self, x):
+            _, result = self._apply_quant_method(x)
+            if fault == "before_reduce":
+                result = result / 0
+            return self._maybe_reduce_final_output(result)
+
+    model = torch.nn.Sequential(Runner())
+    _finite_checks()(
+        model, rank=1, enforce_eager=True, active=lambda: True, module_types=()
+    )
+    if location is None:
+        torch.testing.assert_close(model(torch.ones(2)), torch.full((2,), 2.0))
+    else:
+        with pytest.raises(RuntimeError, match=location):
+            model(torch.ones(2))
+
+
 def _model_functions():
     path = Path(__file__).parents[2] / "vllm/models/glm5next/nvidia/model.py"
     names = {"_try_load_w8a16_attention_weight", "_is_w8a16_g128"}
