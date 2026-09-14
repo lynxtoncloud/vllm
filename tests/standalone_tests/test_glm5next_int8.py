@@ -84,6 +84,26 @@ def _finite_checks():
     return runpy.run_path(str(path))["install_finite_checks"]
 
 
+def test_gemm2_shared_replay_preserves_values_strides_and_disjoint_output():
+    call = _gemm2_call()
+    call["A"] = torch.arange(16, dtype=torch.bfloat16).view(2, 8)[:, :4]
+    share = _wna16_debug()["share_workspace"]
+    shared = share(call, 4096)
+    a, c = shared["A"], shared["C"]
+    assert a.untyped_storage().data_ptr() == c.untyped_storage().data_ptr()
+    assert a.untyped_storage().nbytes() == 4096
+    assert c.storage_offset() * c.element_size() == 256
+    assert a.stride() == call["A"].stride()
+    torch.testing.assert_close(a, call["A"])
+    assert torch.isnan(c).all()
+    c.zero_()
+    torch.testing.assert_close(a, call["A"])
+    assert torch.isnan(call["C"]).all()
+    assert shared["B"] is call["B"]
+    with pytest.raises(ValueError, match="at least"):
+        share(call, 256)
+
+
 @pytest.mark.parametrize("int8,isolate", [(True, True), (True, False), (False, True)])
 def test_gemm2_isolation_preserves_layout_and_gemm1_storage(int8, isolate):
     path = Path(__file__).parents[2] / (

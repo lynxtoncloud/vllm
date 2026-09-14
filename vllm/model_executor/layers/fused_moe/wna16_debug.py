@@ -94,6 +94,38 @@ def restore_call(snapshot: dict, device: str) -> dict:
     return call
 
 
+def share_workspace(call: dict, size_bytes: int) -> dict:
+    """Place GEMM2 A/C in disjoint views of one allocation, as in modular MoE.
+
+    Reproduce the activation/final-output reservation followed by workspace2.
+    This tests allocation size and sharing, not preceding kernels or streams.
+    """
+    a, c = call["A"], call["C"]
+    if a.dtype != c.dtype or a.device != c.device or c.ndim != 3:
+        raise ValueError("Expected matching A/C dtype and device and 3D C")
+
+    def span(value):
+        if not value.numel():
+            raise ValueError("Shared-workspace replay requires nonempty A/C")
+        return 1 + sum((n - 1) * s for n, s in zip(value.shape, value.stride()))
+
+    element_size = a.element_size()
+    common_bytes = max(span(a), c.shape[0] * c.shape[-1]) * element_size
+    c_offset = (common_bytes + 255) // 256 * 256
+    required = c_offset + span(c) * element_size
+    if size_bytes < required:
+        raise ValueError(f"Workspace needs at least {required} bytes, got {size_bytes}")
+    storage = torch.empty(size_bytes, dtype=torch.uint8, device=a.device)
+    shared = call.copy()
+    for name, offset in (("A", 0), ("C", c_offset)):
+        source = call[name]
+        view = storage[offset : offset + span(source) * element_size].view(a.dtype)
+        view = view.as_strided(source.shape, source.stride())
+        view.copy_(source)
+        shared[name] = view
+    return shared
+
+
 def compare(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     rounded_reference = expected.to(actual.dtype)
     actual = actual.cpu().double()
@@ -118,9 +150,17 @@ def main():
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--block-size-k", type=int, choices=(32, 64, 128))
+    parser.add_argument(
+        "--workspace-mib",
+        type=int,
+        default=0,
+        help="Share A/C in an allocation of this size; 0 keeps separate allocations",
+    )
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
+    if args.workspace_mib < 0 or (args.workspace_mib and args.device != "cuda"):
+        parser.error("--workspace-mib must be nonnegative and requires --device cuda")
     snapshot = torch.load(args.snapshot, map_location="cpu", weights_only=True)
     if snapshot["version"] != 1:
         raise ValueError("Unsupported snapshot version")
@@ -129,6 +169,7 @@ def main():
     report = {
         "rank": snapshot["rank"],
         "module": snapshot["module"],
+        "workspace_mib": args.workspace_mib,
         "config": call["config"],
         "strides": snapshot["strides"],
         "original": compare(call["C"], expected),
@@ -155,6 +196,20 @@ def main():
     from vllm.triton_utils import tl
 
     replay = restore_call(snapshot, "cuda")
+    if args.workspace_mib:
+        replay = share_workspace(replay, args.workspace_mib * 1024**2)
+        print(
+            json.dumps(
+                {
+                    "workspace_bytes": replay["A"].untyped_storage().nbytes(),
+                    "a_offset_bytes": replay["A"].storage_offset()
+                    * replay["A"].element_size(),
+                    "c_offset_bytes": replay["C"].storage_offset()
+                    * replay["C"].element_size(),
+                }
+            ),
+            flush=True,
+        )
     if args.block_size_k:
         replay["config"]["BLOCK_SIZE_K"] = args.block_size_k
     compute_type = {

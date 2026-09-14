@@ -348,6 +348,15 @@ reference with a failing replay implicates the isolated kernel path; a passing
 replay leaves live workspace/lifetime interactions to investigate. Finite
 output alone is not an accuracy pass: inspect numerical differences too.
 
+Use `--workspace-mib N` with `--device cuda` to replay A and C as disjoint
+views of one N-MiB allocation, preserving strides and the modular MoE buffer
+offset. The default uses independent allocations. Compare 1, 1321 and 2641
+MiB: with a 128-dimensional FP8 index head, the indexer reserves
+`40 * max_model_len * 132 + 1 MiB`, giving 1321 MiB at 256K and 2641 MiB at
+512K. These are indexer reservations, not measurements of the final workspace
+after other users may grow it. This experiment tests sharing and allocation
+size; it does not reproduce the full model's preceding writes or stream timing.
+
 If independent replay passes, test `VLLM_GLM5NEXT_ISOLATE_GEMM2=1` on both
 nodes while keeping the failing context length and other settings fixed.
 This requires the existing `VLLM_GLM5NEXT_CHECK_FINITE=1` eager diagnostics.
