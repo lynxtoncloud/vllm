@@ -7,6 +7,7 @@ and streaming-loader functions in isolation; full model tests run separately.
 """
 
 import ast
+import builtins
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -36,6 +37,171 @@ def _model_functions():
 
 
 helpers = _model_functions()
+
+
+@pytest.mark.parametrize("rope_dim,has_sinks", [(0, False), (0, True), (64, True)])
+def test_rocm_sparse_metadata_without_persistent_kernel_needs_no_aiter(
+    monkeypatch, rope_dim, has_sinks
+):
+    """Construct real metadata buffers while forbidding the optional dependency."""
+    path = Path(__file__).parents[2] / (
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py"
+    )
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "ROCMAiterMLASparseMetadataBuilder"
+    )
+    init = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    select = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_use_rocm_sparse_triton"
+    )
+    ns: dict = dict(
+        torch=torch,
+        AttentionSpec=object,
+        VllmConfig=object,
+        get_mla_dims=lambda _: NS(kv_lora_rank=512, qk_rope_head_dim=rope_dim),
+        current_platform=NS(num_compute_units=lambda: 96),
+    )
+    exec(
+        compile(ast.Module(body=[select, init], type_ignores=[]), str(path), "exec"), ns
+    )
+    original_import = builtins.__import__
+
+    def no_aiter(name, *args, **kwargs):
+        if name == "aiter" or name.startswith("aiter."):
+            pytest.fail("Nonpersistent metadata must not import AITER")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_aiter)
+    cfg = NS(
+        model_config=NS(
+            dtype=torch.bfloat16,
+            max_model_len=4096,
+            hf_text_config=NS(index_topk=2048),
+            get_num_attention_heads=lambda _: 16,
+        ),
+        cache_config=NS(cache_dtype="auto"),
+        parallel_config=NS(),
+        scheduler_config=NS(max_num_batched_tokens=4),
+        compilation_config=NS(
+            static_forward_context={
+                "layer": NS(impl=NS(sinks=torch.zeros(16) if has_sinks else None))
+            }
+        ),
+    )
+    instance = NS(_init_reorder_batch_threshold=Mock())
+    ns["__init__"](instance, NS(block_size=16), ["layer"], cfg, torch.device("cpu"))
+    assert instance._use_persistent_metadata is False
+    assert instance._prev_metadata_key is None
+    assert instance.paged_kv_indptr.shape == (5,)
+    assert instance.paged_kv_indices.shape == (4 * 2048,)
+
+
+@pytest.mark.parametrize("block_size", [1, 16, 64])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("per_query_lengths", [False, True])
+def test_rocm_decode_logits_read_preshuffled_cache(
+    block_size, next_n, per_query_lengths
+):
+    """Decode and MTP must agree with logical K despite physical page shuffling."""
+    path = Path(__file__).parents[2] / (
+        "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py"
+    )
+    fn = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "fp8_paged_mqa_logits_torch"
+    )
+    ns: dict = dict(
+        torch=torch,
+        F=torch.nn.functional,
+        current_platform=NS(fp8_dtype=lambda: torch.float8_e4m3fn),
+    )
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    torch.manual_seed(71)
+    dim, heads, num_pages = 128, 2, 4
+    capacity = num_pages * block_size
+    length = capacity - 1
+    keys = torch.randn(capacity, dim).to(torch.float8_e4m3fn)
+    scales = torch.rand(capacity) + 0.1
+    cache = torch.empty(num_pages, block_size * (dim + 4), dtype=torch.uint8)
+    token, d = torch.arange(block_size)[:, None], torch.arange(dim)[None, :]
+    offsets = token * dim + d
+    if block_size > 1:
+        offsets = token // 16 * 16 * dim + d // 16 * 256 + token % 16 * 16 + d % 16
+    # Reverse physical pages so the reference also checks the block table.
+    table = torch.arange(num_pages - 1, -1, -1, dtype=torch.int32)
+    for logical, physical in enumerate(table):
+        sl = slice(logical * block_size, (logical + 1) * block_size)
+        cache[physical, offsets] = keys[sl].view(torch.uint8)
+        cache[physical, block_size * dim :] = scales[sl].view(torch.uint8)
+    query = torch.randn(2, next_n, heads, dim).to(torch.float8_e4m3fn)
+    weights = torch.randn(2 * next_n, heads)
+    limits = torch.arange(length - next_n + 1, length + 1)
+    lens = (
+        torch.stack((limits, torch.zeros_like(limits)))
+        if per_query_lengths
+        else torch.tensor([length, 0])
+    )
+    actual = ns["fp8_paged_mqa_logits_torch"](
+        query,
+        cache.view(num_pages, block_size, 1, dim + 4),
+        weights,
+        lens.to(torch.int32),
+        table.repeat(2, 1),
+        capacity,
+    )
+    expected = torch.full((2 * next_n, capacity), float("-inf"))
+    for j, limit in enumerate(limits):
+        scores = (query[0, j].float() @ keys[:limit].float().T).relu()
+        expected[j, :limit] = (scores * weights[j, :, None]).sum(0) * scales[:limit]
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 9])
+def test_rocm_prefill_logits_bound_head_workspace(monkeypatch, rows):
+    """Chunking must preserve logits/masking without an H*M*N workspace."""
+    path = Path(__file__).parents[2] / (
+        "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py"
+    )
+    fn = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "fp8_mqa_logits_torch"
+    )
+    heads, keys, dim = 2, 31, 128
+    budget = heads * 3 * keys * 4
+    ns: dict = dict(torch=torch, _TORCH_MQA_LOGITS_MAX_SCORE_BYTES=budget)
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    torch.manual_seed(15)
+    q = torch.randn(rows, heads, dim).to(torch.float8_e4m3fn)
+    k = torch.randn(keys, dim).to(torch.float8_e4m3fn)
+    scales = torch.rand(keys, 1) + 0.1
+    weights = torch.randn(rows, heads)
+    starts = torch.arange(rows) % keys
+    ends = torch.clamp(starts + 8, max=keys)
+    score = torch.einsum("mhd,nd->hmn", q.bfloat16(), k.bfloat16()).float()
+    expected = ((score * scales.flatten()).relu() * weights.T[:, :, None]).sum(0)
+    columns = torch.arange(keys)[None, :]
+    expected.masked_fill_(
+        (columns < starts[:, None]) | (columns >= ends[:, None]), float("-inf")
+    )
+    original_einsum = torch.einsum
+
+    def bounded_einsum(*args):
+        result = original_einsum(*args)
+        assert result.numel() * 4 <= budget
+        return result
+
+    monkeypatch.setattr(torch, "einsum", bounded_einsum)
+    actual = ns["fp8_mqa_logits_torch"](q, (k, scales), weights, starts, ends)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("index_kpool", [1, 4])

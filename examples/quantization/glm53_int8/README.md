@@ -36,6 +36,13 @@ The converter preserves the tokenizer, processors, templates and vision weights.
 - The ROCm kpool indexer reaches the shared implementation even when AITER is
   disabled. Its existing ROCm logits implementations select their own backend;
   the AITER requirement remains on the unpooled indexer operator.
+- ROCm sparse MLA only allocates AITER persistent metadata when that kernel
+  is needed. NoPE BF16 attention uses the existing Triton path. Its top-k
+  readiness hook requires no event because indices stay on the producing stream.
+- The PyTorch decode fallback reads AMD's preshuffled value tiles and separate
+  page scales for both ordinary and multi-token decode. Prefill chunks the
+  head-expanded score workspace towards 64 MiB (with a minimum of one query),
+  avoiding a full `[heads, queries, keys]` intermediate.
 
 The change adds no custom MoE routing, cache, MHC, sparse-attention or NIXL
 fallbacks. It does not override eager/graph mode, speculative decoding,
@@ -58,6 +65,20 @@ Choose TP/EP, context length and batching for the model dimensions and available
 memory. The new dense GEMM requires complete groups of 128 on each TP rank.
 No extra gfx1100 profile or forced MoE backend is needed by this adaptation.
 
+Without AITER, the PyTorch indexer fallback reads sequence lengths on the host.
+It cannot run inside a full CUDA/HIP graph capture. For GLM on ROCm, use the
+existing breakable piecewise graph mode to run the indexer eagerly between
+captured segments:
+
+```bash
+VLLM_USE_BREAKABLE_CUDAGRAPH=1 vllm serve /path/to/GLM-5.3-Flash-W8A16-G128 \
+  --quantization compressed-tensors --dtype bfloat16 \
+  --compilation-config '{"cudagraph_mode":"PIECEWISE"}'
+```
+
+This configuration still needs validation on the serving GPU. The source does
+not automatically change the user's graph mode or context/batch limits.
+
 ## Validation
 
 ```bash
@@ -70,11 +91,12 @@ No extra gfx1100 profile or forced MoE backend is needed by this adaptation.
 .venv/bin/python -m pytest tests/kernels/moe/test_moe.py -k fused_moe_wn16 -q
 ```
 
-On the local Mac, 97 standalone CPU tests pass. They execute the actual model
+On the local Mac, 115 standalone CPU tests pass. They execute the actual model
 loading functions in isolation, covering format detection, packed-byte decoding,
 BF16/FP16 destinations, projection shard routing, incomplete weight errors,
 MTP checkpoint-name rewriting, and pooled/unpooled ROCm dispatch with AITER
-enabled or disabled. They do not instantiate the full model.
+enabled or disabled, metadata construction without AITER, paged-cache decode
+numerics and bounded prefill score chunks. They do not instantiate the full model.
 
 The full compressed-tensors and MoE suites require a complete vLLM runtime.
 The new GPU GEMM tests require ROCm and cover row/column TP, separate gate/up

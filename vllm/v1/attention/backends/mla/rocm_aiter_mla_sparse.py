@@ -477,6 +477,22 @@ class ROCMAiterMLASparseMetadataBuilder(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
 
+        self._prev_req_extent: int = 0
+        self._prev_indices_extent: int = 0
+        self._prev_metadata_key: tuple | None = None
+        if _use_rocm_sparse_triton(
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_size=self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
+            kv_lora_rank=self.mla_dims.kv_lora_rank,
+            num_prefills=0,
+            num_decodes=1,
+            num_decode_tokens=1,
+            max_query_len=1,
+        ):
+            self._use_persistent_metadata = False
+        if not self._use_persistent_metadata:
+            return
+
         # ----- Persistent MLA metadata buffers -----
         # The aiter sparse decode kernel supports a "persistent" path that
         # uses precomputed work-splitting metadata for better load balancing
@@ -538,10 +554,6 @@ class ROCMAiterMLASparseMetadataBuilder(
             dtype=reduce_partial_map_type,
             device=device,
         )
-
-        self._prev_req_extent: int = 0
-        self._prev_indices_extent: int = 0
-        self._prev_metadata_key: tuple | None = None
 
     def _sparse_decode_max_split(self, max_seq_len: int) -> int:
         """Cap ``max_split_per_batch`` for the aiter sparse-MLA decode reduce.
