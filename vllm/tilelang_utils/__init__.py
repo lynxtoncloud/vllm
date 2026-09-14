@@ -60,8 +60,33 @@ def _get_pass_configs() -> dict[Any, Any]:
     return pass_configs
 
 
+class _DeferredTileLangJit:
+    """Defer ROCm JIT decoration while preserving the TileLang JIT interface."""
+
+    def __init__(self, kernel_function: Callable[..., Any]) -> None:
+        self._kernel_function = kernel_function
+        self._compiled_kernel: Any = None
+        functools.update_wrapper(self, kernel_function)
+
+    def _get_kernel(self) -> Any:
+        if self._compiled_kernel is None:
+            _ensure_tilelang_imported()
+            self._kernel_function.__globals__["tilelang"] = tilelang
+            self._kernel_function.__globals__["T"] = T
+            self._compiled_kernel = tilelang.jit(pass_configs=_get_pass_configs())(
+                self._kernel_function
+            )
+        return self._compiled_kernel
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._get_kernel()(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._get_kernel(), name)
+
+
 def tilelang_jit(kernel_function: Callable[..., Any]) -> Callable[..., Any]:
-    """Apply `tilelang.jit`, deferring until first call on ROCm.
+    """Apply `tilelang.jit`, deferring until first use on ROCm.
 
     ROCm defers JIT decoration so importing the caller's module does not
     require TileLang immediately. CUDA keeps the eager decoration behavior.
@@ -74,18 +99,4 @@ def tilelang_jit(kernel_function: Callable[..., Any]) -> Callable[..., Any]:
         _ensure_tilelang_imported()
         return tilelang.jit(pass_configs=_get_pass_configs())(kernel_function)
 
-    compiled_kernel: Callable[..., Any] | None = None
-
-    @functools.wraps(kernel_function)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        nonlocal compiled_kernel
-        if compiled_kernel is None:
-            _ensure_tilelang_imported()
-            kernel_function.__globals__["tilelang"] = tilelang
-            kernel_function.__globals__["T"] = T
-            compiled_kernel = tilelang.jit(pass_configs=_get_pass_configs())(
-                kernel_function
-            )
-        return compiled_kernel(*args, **kwargs)
-
-    return wrapper
+    return _DeferredTileLangJit(kernel_function)

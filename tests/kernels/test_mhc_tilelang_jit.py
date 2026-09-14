@@ -6,7 +6,7 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -24,19 +24,35 @@ class _PassConfigKey:
 def _install_tilelang_stub(
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, int]:
-    calls = {"jit_decorate": 0, "compiled_call": 0}
+    calls = {"jit_decorate": 0, "compiled_call": 0, "compile": 0, "cache_miss": 0}
 
     tilelang: Any = ModuleType("tilelang")
 
     def jit(**kwargs: Any) -> Any:
         def decorate(func: Any) -> Any:
             calls["jit_decorate"] += 1
+            cache: dict[Any, Any] = {}
+
+            def parse_args(*args: Any, **kw: Any) -> Any:
+                return (args, tuple(sorted(kw.items()))), None
+
+            def compile_kernel(*args: Any, **kw: Any) -> Any:
+                calls["compile"] += 1
+                return object()
 
             def compiled(*args: Any, **kw: Any) -> Any:
                 calls["compiled_call"] += 1
+                key, _ = parse_args(*args, **kw)
+                if key not in cache:
+                    calls["cache_miss"] += 1
+                    cache[key] = compile_kernel(*args, **kw)
                 return func.__name__
 
-            return compiled
+            jit_impl: Any = compiled
+            jit_impl.compile = compile_kernel
+            jit_impl.func = SimpleNamespace(parse_args=parse_args)
+            jit_impl._kernel_cache = cache
+            return jit_impl
 
         return decorate
 
@@ -76,6 +92,45 @@ def test_tilelang_jit_decorator_is_lazy_only_on_rocm(
     else:
         assert calls["jit_decorate"] == decorated_calls
     assert calls["compiled_call"] == 1
+
+
+@pytest.mark.parametrize("is_rocm", [True, False])
+@pytest.mark.parametrize("runtime_first", [True, False])
+def test_tilelang_compile_only_warmup_populates_runtime_cache(
+    monkeypatch: pytest.MonkeyPatch, is_rocm: bool, runtime_first: bool
+) -> None:
+    """Warmup must compile without launching, including before the first call."""
+    from vllm.model_executor.warmup.jit_warmup_tilelang_helper import compile_tilelang
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: not is_rocm)
+    calls = _install_tilelang_stub(monkeypatch)
+    module = importlib.import_module("vllm.tilelang_utils")
+
+    def sample_kernel(value: int, *, scale: int = 1) -> None:
+        pass
+
+    # TileLang binds language globals in the decorated function's module.
+    monkeypatch.setitem(sample_kernel.__globals__, "T", None)
+    monkeypatch.setitem(sample_kernel.__globals__, "tilelang", None)
+    kernel = module.tilelang_jit(sample_kernel)
+    assert calls["jit_decorate"] == (0 if is_rocm else 1)
+
+    if runtime_first:
+        kernel(1, scale=2)
+    launches = calls["compiled_call"]
+    misses = calls["cache_miss"]
+
+    compile_tilelang(kernel, 3, scale=4)
+
+    assert calls["compiled_call"] == launches
+    assert calls["compile"] == int(runtime_first) + 1
+    if is_rocm:
+        assert sample_kernel.__globals__["T"] is module.T
+    assert kernel(3, scale=4) == "sample_kernel"
+    assert kernel(3, scale=4) == "sample_kernel"
+    assert calls["cache_miss"] == misses
+    assert calls["jit_decorate"] == 1
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="Test requires ROCm")
