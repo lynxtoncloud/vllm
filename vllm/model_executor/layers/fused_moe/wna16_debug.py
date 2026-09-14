@@ -154,6 +154,27 @@ def same_bits(actual: torch.Tensor, expected: torch.Tensor) -> bool:
     )
 
 
+class ViewPointer:
+    """Report view bounds for GEMM2's masked accesses, retaining the allocation.
+
+    Triton HIP accepts ptr_range() instead of using the entire backing storage.
+    This is valid only when the kernel's accesses stay inside the tensor view.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+
+    def __getattr__(self, name):
+        return getattr(self.tensor, name)
+
+    def ptr_range(self) -> int:
+        tensor = self.tensor
+        if not tensor.numel():
+            return 0
+        span = 1 + sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride()))
+        return span * tensor.element_size()
+
+
 def audit_workspace(call: dict, original: dict) -> None:
     """Check restored bytes and the pointers actually received by a GPU kernel."""
     from vllm.triton_utils import tl, triton
@@ -234,6 +255,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--block-size-k", type=int, choices=(32, 64, 128))
     parser.add_argument(
+        "--view-pointer-range",
+        action="store_true",
+        help="Report A/C view byte spans to Triton without copying or reallocating",
+    )
+    parser.add_argument(
         "--audit-workspace",
         action="store_true",
         help="Check restored bytes and Triton pointers/loads/stores before replay",
@@ -251,6 +277,8 @@ def main():
         parser.error("--workspace-mib must be nonnegative and requires --device cuda")
     if args.audit_workspace and args.device != "cuda":
         parser.error("--audit-workspace requires --device cuda")
+    if args.view_pointer_range and args.device != "cuda":
+        parser.error("--view-pointer-range requires --device cuda")
     snapshot = torch.load(args.snapshot, map_location="cpu", weights_only=True)
     if snapshot["version"] != 1:
         raise ValueError("Unsupported snapshot version")
@@ -260,6 +288,7 @@ def main():
         "rank": snapshot["rank"],
         "module": snapshot["module"],
         "workspace_mib": args.workspace_mib,
+        "view_pointer_range": args.view_pointer_range,
         "config": call["config"],
         "strides": snapshot["strides"],
         "original": compare(call["C"], expected),
@@ -304,6 +333,24 @@ def main():
         replay["config"]["BLOCK_SIZE_K"] = args.block_size_k
     if args.audit_workspace:
         audit_workspace(replay, call)
+    launch = replay.copy()
+    if args.view_pointer_range:
+        for name in ("A", "C"):
+            launch[name] = ViewPointer(replay[name])
+        print(
+            json.dumps(
+                {
+                    "view_pointer_bytes": {
+                        name: launch[name].ptr_range() for name in ("A", "C")
+                    },
+                    "same_addresses": all(
+                        launch[name].data_ptr() == replay[name].data_ptr()
+                        for name in ("A", "C")
+                    ),
+                }
+            ),
+            flush=True,
+        )
     compute_type = {
         torch.bfloat16: tl.bfloat16,
         torch.float16: tl.float16,
@@ -326,7 +373,7 @@ def main():
                 flush=True,
             )
         invoke_fused_moe_wna16_triton_kernel(
-            **replay,
+            **launch,
             compute_type=compute_type,
             use_int8_w8a16=True,
             use_int4_w4a16=False,

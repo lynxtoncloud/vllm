@@ -366,6 +366,15 @@ launch. This distinguishes restoration, pointer conversion, basic kernel
 access and GEMM2 failures. The audit adds synchronization and allocations;
 compare with ordinary replay if the failure disappears. No serving path changes.
 
+Use `--view-pointer-range` for a compilation-only comparison: A/C keep their
+original allocations, addresses, values and strides, but expose `ptr_range()`
+to Triton HIP using each view's byte span instead of the backing storage size.
+Triton 3.7.1 normally drops the `tt.pointer_range = 32` attribute when a view's
+backing storage exceeds `2**31 - 1` bytes. This option tests that specialization
+without changing buffer reuse. The reported span includes stride gaps; the
+GEMM2 masks must keep accesses inside these views. This is a replay diagnostic,
+not a global override or a serving fix. Compare numerical error, not just NaNs.
+
 If independent replay passes, test `VLLM_GLM5NEXT_ISOLATE_GEMM2=1` on both
 nodes while keeping the failing context length and other settings fixed.
 This requires the existing `VLLM_GLM5NEXT_CHECK_FINITE=1` eager diagnostics.

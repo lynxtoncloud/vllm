@@ -120,6 +120,21 @@ def test_replay_byte_audit_detects_differences_hidden_by_numeric_equality():
     assert not same_bits(torch.tensor([1.0]), torch.tensor([[1.0]]))
 
 
+def test_replay_view_pointer_preserves_address_and_bounds_strided_accesses():
+    storage = torch.arange(1024, dtype=torch.bfloat16)
+    view = storage[32:64].view(4, 8)[:, :3]
+    pointer = _wna16_debug()["ViewPointer"](view)
+    assert pointer.data_ptr() == view.data_ptr()
+    assert pointer.size() == view.size()
+    assert pointer.stride() == (8, 1)
+    assert pointer.dtype == view.dtype
+    assert pointer.ptr_range() == (3 * 8 + 3) * 2
+    assert pointer.ptr_range() > view.numel() * view.element_size()
+    assert pointer.ptr_range() < storage.untyped_storage().nbytes()
+    view[0, 0] = 17
+    assert pointer.tensor[0, 0].item() == 17
+
+
 @pytest.mark.parametrize("int8,isolate", [(True, True), (True, False), (False, True)])
 def test_gemm2_isolation_preserves_layout_and_gemm1_storage(int8, isolate):
     path = Path(__file__).parents[2] / (
