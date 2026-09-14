@@ -6,6 +6,12 @@ set -euo pipefail
 role=${1:?Usage: launch_pd.sh p0|p1|d0|d1 [--check|--dry-run]}
 mode=${2:-run}
 case "$mode" in run|--check|--dry-run) ;; *) exit 2 ;; esac
+enforce_eager=${ENFORCE_EAGER:-0}
+case "$enforce_eager" in
+  0) breakable_graph=1 ;;
+  1) breakable_graph=0 ;;
+  *) echo "ENFORCE_EAGER must be 0 or 1" >&2; exit 2 ;;
+esac
 
 p0=${P0_IP:-10.5.10.36}
 p1=${P1_IP:-10.5.10.3}
@@ -34,7 +40,7 @@ fi
 cmd=(env
   'HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7'
   VLLM_WORKER_MULTIPROC_METHOD=spawn
-  VLLM_USE_BREAKABLE_CUDAGRAPH=1
+  "VLLM_USE_BREAKABLE_CUDAGRAPH=$breakable_graph"
   VLLM_ENGINE_READY_TIMEOUT_S=3600
   "VLLM_HOST_IP=$node_ip"
   "VLLM_NIXL_SIDE_CHANNEL_HOST=$node_ip"
@@ -54,8 +60,12 @@ cmd=(env
   --max-model-len "${MAX_MODEL_LEN:-131072}"
   --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-512}"
   --enable-chunked-prefill
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.90}"
-  --compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":16}')
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.90}")
+if [[ "$enforce_eager" == 1 ]]; then
+  cmd+=(--enforce-eager)
+else
+  cmd+=(--compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":16}')
+fi
 if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
   cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
 fi

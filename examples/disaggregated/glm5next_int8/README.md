@@ -316,6 +316,32 @@ CPU-only client regression checks (no server or checkpoint required):
 
 ## UCX registration diagnostics and remaining PD acceptance
 
+### Repeated output or non-finite logprobs
+
+A completed HTTP request with repetitive output is not a correctness pass.
+Compare a fresh prompt sent directly to D0 with a request through the proxy;
+reusing a prompt can reuse prefix state from an earlier request. A JSON error
+reporting `nan` in logprobs requires numerical investigation, not a longer RPC
+timeout or a change to sampling penalties.
+
+For a controlled graph-versus-eager comparison, restart both D0 and D1 with
+`ENFORCE_EAGER=1` added to their existing launch environments. Preserve the
+working UCX settings and `MAX_MODEL_LEN=1048576`. This selects `--enforce-eager`
+and disables breakable graphs; it does not change concurrency, TP/EP, cache
+dtype or async scheduling. The default remains `ENFORCE_EAGER=0` (piecewise
+graphs). Apply the same setting on both nodes of a TP group.
+
+Also set `VLLM_RAISE_ON_LOGIT_NANS=1` during diagnosis. This existing vLLM switch
+counts NaNs in raw logits and raises with affected request IDs instead of
+continuing to sample. It can stop the diagnostic engine on a bad request.
+NaN logprobs alone do not prove raw logits contain NaNs: infinities can also
+make log-softmax non-finite. Retain the request/logprobs and worker traceback.
+Successful eager output would narrow the investigation to graph-related
+execution; it would not certify the original graph configuration or PD state
+transfer. Restore graph mode only after resolving and retesting the cause.
+
+### Registration checks
+
 The launcher now registers and deregisters an 8 MiB host buffer and an 8 MiB
 VRAM buffer on each GPU before loading model weights. A failed probe stops
 startup. `NIXL_PREFLIGHT_MIB` changes this probe size; it does not change model
