@@ -334,6 +334,19 @@ graphs). Apply the same setting on both nodes of a TP group.
 Also set `VLLM_RAISE_ON_LOGIT_NANS=1` during diagnosis. This existing vLLM switch
 counts NaNs in raw logits and raises with affected request IDs instead of
 continuing to sample. It can stop the diagnostic engine on a bad request.
+To locate an earlier failing module, additionally enable
+`VLLM_GLM5NEXT_CHECK_FINITE=1` on both nodes of the diagnostic TP group. This
+requires `--enforce-eager` and installs checks at decoder, attention/MLP,
+linear, embedding and normalization boundaries. It reports the first observed
+non-finite input, output or directly owned floating-point parameter with the
+module path, TP rank, shape, dtype and count. Parameters are checked on first
+use; buffers and forwards without attention metadata are skipped. It does not
+inspect every internal fused operation or prove cache correctness. A module's
+output failure narrows the boundary; it does not by itself identify the kernel
+or rank that originally produced bad data before a collective.
+The checks synchronize GPU work and may change timing, so use short fresh
+prompts for diagnosis, not the performance suite. The switch defaults off and
+does not replace or sanitize values. Disable it before performance testing.
 NaN logprobs alone do not prove raw logits contain NaNs: infinities can also
 make log-softmax non-finite. Retain the request/logprobs and worker traceback.
 Successful eager output would narrow the investigation to graph-related

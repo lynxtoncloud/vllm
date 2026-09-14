@@ -8,6 +8,7 @@ and streaming-loader functions in isolation; full model tests run separately.
 
 import ast
 import builtins
+import runpy
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -18,6 +19,76 @@ import torch
 from vllm.scalar_type import scalar_types
 
 DEVICE = "cpu"
+
+
+def _finite_checks():
+    path = Path(__file__).parents[2] / "vllm/models/glm5next/diagnostics.py"
+    return runpy.run_path(str(path))["install_finite_checks"]
+
+
+@pytest.mark.parametrize("source", ["input", "parameter", "output"])
+def test_finite_diagnostics_identify_origin_before_downstream_execution(source):
+    class Broken(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, x):
+            if source == "output":
+                return x / 0
+            return x * self.scale
+
+    layer = Broken()
+    downstream = torch.nn.Identity()
+    ran = Mock()
+    downstream.register_forward_hook(ran)
+    model = torch.nn.Sequential(layer, downstream)
+    _finite_checks()(
+        model, rank=9, enforce_eager=True, active=lambda: True, module_types=(Broken,)
+    )
+    x = torch.ones(2)
+    if source == "input":
+        x[0] = float("nan")
+    elif source == "parameter":
+        layer.scale.data.fill_(float("nan"))
+    location = {
+        "input": r"module=model input\[0\]",
+        "parameter": "module=0 parameter=scale",
+        "output": "module=0 output",
+    }[source]
+    with pytest.raises(RuntimeError, match=f"tp_rank=9 {location}"):
+        model(x)
+    ran.assert_not_called()
+
+
+def test_finite_diagnostics_skip_profiling_and_unused_cache_but_check_real_kwargs():
+    class Echo(torch.nn.Module):
+        def forward(self, *, payload):
+            return {"result": (payload["x"], None)}
+
+    model = Echo()
+    model.register_buffer("unused_cache", torch.tensor([float("nan")]))
+    active = False
+    _finite_checks()(
+        model, rank=0, enforce_eager=True, active=lambda: active, module_types=()
+    )
+    x = torch.tensor([float("inf")])
+    assert model(payload={"x": x})["result"][0] is x
+    active = True
+    with pytest.raises(RuntimeError, match=r"kwargs\[payload\]\[x\]"):
+        model(payload={"x": x})
+    x = torch.ones(2)
+    assert model(payload={"x": x})["result"][0] is x
+    torch.testing.assert_close(x, torch.ones(2))
+
+
+def test_finite_diagnostics_reject_graph_mode_before_installing_hooks():
+    model = torch.nn.Linear(2, 2)
+    with pytest.raises(ValueError, match="requires --enforce-eager"):
+        _finite_checks()(
+            model, rank=0, enforce_eager=False, active=lambda: True, module_types=()
+        )
+    assert not model._forward_hooks and not model._forward_pre_hooks
 
 
 def _model_functions():

@@ -7,6 +7,7 @@ from typing import ClassVar, Literal
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -24,6 +25,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -694,6 +696,32 @@ class Glm5NextModel(nn.Module):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+
+        if envs.VLLM_GLM5NEXT_CHECK_FINITE:
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+            from vllm.models.glm5next.diagnostics import install_finite_checks
+
+            count = install_finite_checks(
+                self,
+                rank=get_tensor_model_parallel_rank(),
+                enforce_eager=vllm_config.model_config.enforce_eager,
+                active=lambda: (
+                    is_forward_context_available()
+                    and get_forward_context().attn_metadata is not None
+                ),
+                module_types=(
+                    LinearBase,
+                    RMSNorm,
+                    VocabParallelEmbedding,
+                    Glm5NextDecoderLayer,
+                ),
+            )
+            logger.warning(
+                "GLM finite checks enabled on %d modules; eager diagnostics only", count
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
