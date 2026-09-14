@@ -104,6 +104,22 @@ def test_gemm2_shared_replay_preserves_values_strides_and_disjoint_output():
         share(call, 256)
 
 
+def test_replay_byte_audit_accepts_matching_nan_and_strided_values():
+    same_bits = _wna16_debug()["same_bits"]
+    value = torch.tensor([[float("nan"), 1, 2, 3]], dtype=torch.bfloat16)[:, ::2]
+    assert same_bits(value, value.clone())
+    changed = value.clone()
+    changed[0, 1] = 4
+    assert not same_bits(value, changed)
+
+
+def test_replay_byte_audit_detects_differences_hidden_by_numeric_equality():
+    same_bits = _wna16_debug()["same_bits"]
+    assert not same_bits(torch.tensor([0.0]), torch.tensor([-0.0]))
+    assert not same_bits(torch.tensor([1.0]), torch.tensor([1.0]).double())
+    assert not same_bits(torch.tensor([1.0]), torch.tensor([[1.0]]))
+
+
 @pytest.mark.parametrize("int8,isolate", [(True, True), (True, False), (False, True)])
 def test_gemm2_isolation_preserves_layout_and_gemm1_storage(int8, isolate):
     path = Path(__file__).parents[2] / (

@@ -357,6 +357,15 @@ MiB: with a 128-dimensional FP8 index head, the indexer reserves
 after other users may grow it. This experiment tests sharing and allocation
 size; it does not reproduce the full model's preceding writes or stream timing.
 
+Add `--audit-workspace` to compare every restored tensor's bytes with the
+snapshot, then run a small Triton probe before GEMM2. It reports the A/C
+addresses observed inside the GPU kernel, copies A into an independent buffer,
+and fills C with 3. A mismatched address is reported without dereferencing it.
+Each subsequent GEMM2 replay also checks A and the NaN output sentinel before
+launch. This distinguishes restoration, pointer conversion, basic kernel
+access and GEMM2 failures. The audit adds synchronization and allocations;
+compare with ordinary replay if the failure disappears. No serving path changes.
+
 If independent replay passes, test `VLLM_GLM5NEXT_ISOLATE_GEMM2=1` on both
 nodes while keeping the failing context length and other settings fixed.
 This requires the existing `VLLM_GLM5NEXT_CHECK_FINITE=1` eager diagnostics.

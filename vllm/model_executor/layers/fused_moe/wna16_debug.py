@@ -144,12 +144,100 @@ def compare(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     }
 
 
+def same_bits(actual: torch.Tensor, expected: torch.Tensor) -> bool:
+    """Compare logical tensor bytes, including NaN payloads and signed zeros."""
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        return False
+    return torch.equal(
+        actual.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
+        expected.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
+    )
+
+
+def audit_workspace(call: dict, original: dict) -> None:
+    """Check restored bytes and the pointers actually received by a GPU kernel."""
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def probe(
+        A,
+        C,
+        Copy,
+        Addresses,
+        expected_a,
+        expected_c,
+        NA: tl.constexpr,
+        NC: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        if tl.program_id(0) == 0:
+            tl.store(Addresses, A.to(tl.uint64))
+            tl.store(Addresses + 1, C.to(tl.uint64))
+        # Do not dereference a pointer that the launcher unexpectedly changed.
+        if A.to(tl.uint64) == expected_a.to(tl.uint64):
+            values = tl.load(A + offsets, offsets < NA, other=0)
+            tl.store(Copy + offsets, values, offsets < NA)
+        if C.to(tl.uint64) == expected_c.to(tl.uint64):
+            tl.store(C + offsets, 3.0, offsets < NC)
+
+    matched = {
+        name: same_bits(value, original[name])
+        for name, value in call.items()
+        if isinstance(value, torch.Tensor)
+    }
+    print(
+        json.dumps({"audit": "restored_bytes", "matches_snapshot": matched}), flush=True
+    )
+    if not all(matched.values()):
+        raise RuntimeError("Restored operands differ from the snapshot before GEMM2")
+    a, c = call["A"], call["C"]
+    if not a.is_contiguous() or not c.is_contiguous():
+        raise ValueError("Pointer probe requires contiguous A/C views")
+    copied = torch.full(a.shape, float("nan"), dtype=a.dtype, device=a.device)
+    addresses = torch.zeros(2, dtype=torch.uint64, device=a.device)
+    c.fill_(float("nan"))
+    probe[(triton.cdiv(max(a.numel(), c.numel()), 256),)](
+        a,
+        c,
+        copied,
+        addresses,
+        a.data_ptr(),
+        c.data_ptr(),
+        a.numel(),
+        c.numel(),
+        256,
+    )
+    torch.accelerator.synchronize()
+    observed = addresses.cpu().tolist()
+    print(
+        json.dumps(
+            {
+                "audit": "triton_pointer_probe",
+                "expected_a": hex(a.data_ptr()),
+                "observed_a": hex(observed[0]),
+                "expected_c": hex(c.data_ptr()),
+                "observed_c": hex(observed[1]),
+                "a_read_matches_snapshot": same_bits(copied, original["A"]),
+                "a_unchanged": same_bits(a, original["A"]),
+                "c_store_3_bad": int((c.cpu() != 3).sum()),
+            }
+        ),
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--block-size-k", type=int, choices=(32, 64, 128))
+    parser.add_argument(
+        "--audit-workspace",
+        action="store_true",
+        help="Check restored bytes and Triton pointers/loads/stores before replay",
+    )
     parser.add_argument(
         "--workspace-mib",
         type=int,
@@ -161,6 +249,8 @@ def main():
         parser.error("--repeats must be positive")
     if args.workspace_mib < 0 or (args.workspace_mib and args.device != "cuda"):
         parser.error("--workspace-mib must be nonnegative and requires --device cuda")
+    if args.audit_workspace and args.device != "cuda":
+        parser.error("--audit-workspace requires --device cuda")
     snapshot = torch.load(args.snapshot, map_location="cpu", weights_only=True)
     if snapshot["version"] != 1:
         raise ValueError("Unsupported snapshot version")
@@ -212,6 +302,8 @@ def main():
         )
     if args.block_size_k:
         replay["config"]["BLOCK_SIZE_K"] = args.block_size_k
+    if args.audit_workspace:
+        audit_workspace(replay, call)
     compute_type = {
         torch.bfloat16: tl.bfloat16,
         torch.float16: tl.float16,
@@ -220,6 +312,19 @@ def main():
     for iteration in range(args.repeats):
         # A NaN sentinel exposes missing writes as well as arithmetic failures.
         replay["C"].fill_(float("nan"))
+        if args.audit_workspace:
+            print(
+                json.dumps(
+                    {
+                        "audit": "before_gemm2",
+                        "replay": iteration,
+                        "c_nan_count": int(torch.isnan(replay["C"].cpu()).sum()),
+                        "expected_nan_count": replay["C"].numel(),
+                        "a_matches_snapshot": same_bits(replay["A"], call["A"]),
+                    }
+                ),
+                flush=True,
+            )
         invoke_fused_moe_wna16_triton_kernel(
             **replay,
             compute_type=compute_type,
