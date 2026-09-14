@@ -348,6 +348,15 @@ reference with a failing replay implicates the isolated kernel path; a passing
 replay leaves live workspace/lifetime interactions to investigate. Finite
 output alone is not an accuracy pass: inspect numerical differences too.
 
+If independent replay passes, test `VLLM_GLM5NEXT_ISOLATE_GEMM2=1` on both
+nodes while keeping the failing context length and other settings fixed.
+This requires the existing `VLLM_GLM5NEXT_CHECK_FINITE=1` eager diagnostics.
+It allocates only the INT8 GEMM2 output independently instead of reusing the
+GEMM1 workspace; inputs, weights, launch configuration and reduction stay the
+same. The default is off. This is a diagnostic comparison, not a confirmed
+fix. Additional live storage is `tokens * top_k * hidden_size * dtype_size`
+bytes (128 KiB for the observed two-token BF16 case), plus allocator overhead.
+
 A completed HTTP request with repetitive output is not a correctness pass.
 Compare a fresh prompt sent directly to D0 with a request through the proxy;
 reusing a prompt can reuse prefix state from an earlier request. A JSON error

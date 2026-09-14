@@ -84,6 +84,41 @@ def _finite_checks():
     return runpy.run_path(str(path))["install_finite_checks"]
 
 
+@pytest.mark.parametrize("int8,isolate", [(True, True), (True, False), (False, True)])
+def test_gemm2_isolation_preserves_layout_and_gemm1_storage(int8, isolate):
+    path = Path(__file__).parents[2] / (
+        "vllm/model_executor/layers/fused_moe/experts/triton_moe.py"
+    )
+    cls = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "TritonWNA16Experts"
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_allocate_gemm2_output"
+    )
+    namespace = {
+        "torch": torch,
+        "_resize_cache": lambda cache, shape: cache[:16].view(shape),
+    }
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    owner = NS(quant_config=NS(use_int8_w8a16=int8))
+    if isolate:
+        owner._diagnostic_isolate_gemm2 = True
+    workspace = torch.ones(32, dtype=torch.bfloat16)
+    output = namespace["_allocate_gemm2_output"](owner, workspace, (2, 2, 4))
+    assert output.shape == (2, 2, 4) and output.stride() == (8, 4, 1)
+    assert output.dtype == workspace.dtype and output.device == workspace.device
+    output.zero_()
+    assert workspace[:16].eq(1 if int8 and isolate else 0).all()
+    assert workspace[16:].eq(1).all()
+
+
 @pytest.mark.parametrize("source", ["input", "parameter", "output"])
 def test_finite_diagnostics_identify_origin_before_downstream_execution(source):
     class Broken(torch.nn.Module):

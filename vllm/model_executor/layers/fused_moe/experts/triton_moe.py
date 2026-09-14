@@ -581,6 +581,16 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
 
 class TritonWNA16Experts(TritonExperts):
+    def _allocate_gemm2_output(
+        self, workspace: torch.Tensor, shape: tuple[int, ...]
+    ) -> torch.Tensor:
+        cache = _resize_cache(workspace, shape)
+        if self.quant_config.use_int8_w8a16 and getattr(
+            self, "_diagnostic_isolate_gemm2", False
+        ):
+            return torch.empty_like(cache)
+        return cache
+
     @staticmethod
     def _supports_current_device() -> bool:
         return current_platform.is_cuda_alike() or current_platform.is_xpu()
@@ -702,7 +712,9 @@ class TritonWNA16Experts(TritonExperts):
         intermediate_cache2 = _resize_cache(
             workspace13, (num_tokens * top_k_num, activation_out_dim)
         )
-        intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+        intermediate_cache3 = self._allocate_gemm2_output(
+            workspace2, (num_tokens, top_k_num, K)
+        )
 
         # Include fused shared-expert rows while preserving EP remapping.
         num_align_experts = w1.shape[0] if expert_map is None else global_num_experts

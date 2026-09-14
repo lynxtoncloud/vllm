@@ -102,6 +102,9 @@ def install_finite_checks(
     def trace_wna16_stages(experts: Any, name: str) -> None:
         from vllm import envs
 
+        if envs.VLLM_GLM5NEXT_ISOLATE_GEMM2:
+            experts._diagnostic_isolate_gemm2 = True
+
         if directory := envs.VLLM_GLM5NEXT_DUMP_DIR:
             from vllm.model_executor.layers.fused_moe.wna16_debug import save_failure
 
