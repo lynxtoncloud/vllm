@@ -313,3 +313,73 @@ CPU-only client regression checks (no server or checkpoint required):
 .venv/bin/python -m pytest --confcutdir=tests/benchmarks \
   tests/benchmarks/test_glm53_pd_checks.py -q
 ```
+
+## UCX registration diagnostics and remaining PD acceptance
+
+The launcher now registers and deregisters an 8 MiB host buffer and an 8 MiB
+VRAM buffer on each GPU before loading model weights. A failed probe stops
+startup. `NIXL_PREFLIGHT_MIB` changes this probe size; it does not change model
+context, KV-cache capacity or concurrency. Small-buffer success cannot prove
+that a full KV allocation or simultaneous eight-worker registration succeeds.
+
+For `Failed to ucp_mem_map` / `NIXL_ERR_BACKEND`, retain the earlier native UCX
+error. For example, `ibv_reg_mr ... Invalid argument` on `mlx5_bond_0` while
+registering `(rocm)` memory identifies a GPU memory registration failure in the
+RDMA path. It does not establish a model OOM or a Kpool descriptor error.
+`NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` do not select UCX network devices.
+
+Run this on the affected host after stopping its failed engine and releasing
+its workers. It loads no model and makes no connection to the other hosts:
+
+```bash
+cd /data/vllm
+set -o pipefail
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/python \
+  examples/disaggregated/glm5next_int8/check_nixl.py \
+  --sizes-mib 8 2048 16934 \
+  2>&1 | tee /data/logs/glm53-int8-nixl-registration.log
+```
+
+The largest probe approximates the reported 17,756,385,280-byte KV allocation.
+Buffers are allocated one at a time in fresh subprocesses. The report includes
+host versus GPU results, GPU index, size, memlock limits, allocator/UCX settings,
+and the UCX libraries actually loaded by NIXL. `ucx_info` on PATH may describe a
+different UCX installation from the wheel. Exit status is nonzero if any case
+fails or exceeds its timeout. No automatic transport fallback is performed.
+
+Interpretation:
+
+- Host succeeds, even small VRAM fails: investigate the ROCm peer-memory/DMA-BUF
+  path, NIC driver and the loaded UCX build before retrying model startup.
+- Small VRAM succeeds but large VRAM fails: inspect native UCX errors for
+  registration-size/resource constraints or allocator behavior. This probe
+  identifies the boundary; it does not repair the driver.
+- All local probes pass: test full engine registration next, then inter-host
+  handshakes and real payload transfer. Local registration is not an RDMA
+  bandwidth, reachability or correctness test.
+
+For an explicit TCP comparison only, repeat the 8 MiB probe with
+`UCX_TLS=tcp,sm,self,rocm UCX_NET_DEVICES=all` in the environment. ROCm transports
+must remain enabled to recognize/copy GPU buffers (see the
+[UCX transport documentation](https://openucx.readthedocs.io/en/master/faq.html#which-transports-does-ucx-use)).
+Passing this comparison does not certify the RDMA path. Record the transport
+in performance results; do not substitute TCP throughput for RDMA capacity.
+
+The remaining deployment acceptance items are:
+
+- Both TP16 groups use identical code/model and compatible transfer geometry.
+  P0/P1 and D0/D1 are two distributed engines, not four independent replicas.
+- Scheduler side channels are on P0:5557 and D0:5657. The NIXL/UCX data path
+  additionally needs cross-host connectivity; opening HTTP ports alone is
+  insufficient. Keep handshake compatibility checking enabled.
+- The toy proxy's health endpoint only checks its own process. It can forward
+  to decode without transfer metadata if prefill returns none. Continue to
+  require actual decoder NIXL byte/count increases and no failures in
+  `run_checks.py`; a successful HTTP answer alone is not PD acceptance.
+- Prefix reuse, non-block-aligned prompts, long-context output correctness,
+  multimodal transfer and request cancellation/restart still need four-host
+  execution. The included functional suite covers retrieval and media content;
+  it does not yet certify cancellation cleanup, failover or long-duration soak.
+- Performance starts after functional acceptance, measuring all 32 GPUs and
+  the selected transport. Local CPU tests and registration probes do not prove
+  production readiness.

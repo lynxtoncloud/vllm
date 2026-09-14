@@ -100,6 +100,9 @@ print("NIXL ROCm:", nixl_api.__file__)
 print("Model shards present:", len(shards))
 PY
 git log -1 --oneline
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/python \
+  examples/disaggregated/glm5next_int8/check_nixl.py \
+  --sizes-mib "${NIXL_PREFLIGHT_MIB:-8}"
 [[ "$mode" == --check ]] && exit 0
 
 mkdir -p "$log_dir"

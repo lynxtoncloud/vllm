@@ -289,3 +289,67 @@ def test_full_client_workflow_with_mock_http_and_performance_gate(
     assert report["passed"]
     assert report["stages"][0]["completed"] == 4
     assert report["stages"][0]["output_tokens"] == 4 * 256
+
+
+@pytest.fixture
+def nixl_probe():
+    probe_spec = importlib.util.spec_from_file_location(
+        "nixl_probe", SCRIPT.with_name("check_nixl.py")
+    )
+    assert probe_spec is not None and probe_spec.loader is not None
+    module = importlib.util.module_from_spec(probe_spec)
+    probe_spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("memory_type, device", [("DRAM", 0), ("VRAM", 7)])
+def test_nixl_probe_registers_storage_and_releases_it(nixl_probe, memory_type, device):
+    """The probe must pass the real device/storage range and deregister it."""
+    from unittest.mock import MagicMock, call
+
+    tensor = MagicMock()
+    tensor.get_device.return_value = 7
+    tensor.untyped_storage.return_value.data_ptr.return_value = 4096
+    tensor.untyped_storage.return_value.nbytes.return_value = 8 * 1024 * 1024
+    agent = MagicMock()
+    nixl_probe.register_buffer(agent, tensor, memory_type)
+    descs = agent.get_reg_descs.return_value
+    assert agent.mock_calls == [
+        call.get_reg_descs([(4096, 8 * 1024 * 1024, device, "")], memory_type),
+        call.register_memory(descs, backends=["UCX"]),
+        call.deregister_memory(descs, backends=["UCX"]),
+    ]
+
+
+def test_nixl_probe_does_not_hide_backend_failure(nixl_probe):
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent.register_memory.side_effect = RuntimeError("NIXL_ERR_BACKEND")
+    with pytest.raises(RuntimeError, match="NIXL_ERR_BACKEND"):
+        nixl_probe.register_buffer(agent, MagicMock(), "VRAM")
+    agent.deregister_memory.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, "exit", "timeout"])
+def test_nixl_probe_matrix_reports_partial_failure(nixl_probe, monkeypatch, failure):
+    """Native failures must not hide other GPUs or yield a successful preflight."""
+    calls: list[list[str]] = []
+
+    def execute(cmd, timeout):
+        calls.append(cmd)
+        if len(calls) == 2:
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            if failure == "exit":
+                return SimpleNamespace(returncode=1)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(nixl_probe.subprocess, "run", execute)
+    args = SimpleNamespace(
+        devices=[0, 7], sizes_mib=[8, 2048], memory=["DRAM", "VRAM"], timeout=10
+    )
+    assert nixl_probe.run_matrix(args) == (0 if failure is None else 1)
+    assert len(calls) == 6  # host once per size; each GPU once per size
+    assert [cmd[-1] for cmd in calls] == ["DRAM"] * 2 + ["VRAM"] * 4
+    assert [cmd[4] for cmd in calls] == ["0"] * 4 + ["7"] * 2
