@@ -175,3 +175,141 @@ The launcher is checked locally with Bash syntax validation and four role
 dry-runs. GPU startup, ROCm NIXL transport, model outputs, and PD performance
 must be validated on the four hosts. Single-host INT8 inference success is not
 a substitute for these checks.
+
+## Functional acceptance and performance
+
+Run the committed client on P0, against the PD proxy on port 8000. All four
+servers must use `MAX_MODEL_LEN=1048576`. Unset `MAX_NUM_SEQS` to leave scheduler
+concurrency at the vLLM default. The client's concurrency sweep below specifies
+offered load; it does not change server limits.
+
+The client requires `httpx`, `Pillow`, `pybase64`, `regex`, and `transformers` in the existing
+`.venv`, the local model tokenizer, and `ffmpeg` on PATH with a working `libx264`
+encoder. It generates its own 448x448 images and a nine-second MP4 in the result
+directory and sends media inline. No public media download or cross-host media
+mount is needed. Keep the proxy's `NO_PROXY` settings from the command above.
+
+```bash
+cd /data/vllm
+.venv/bin/python -c 'import httpx, PIL, pybase64, regex, transformers'
+ffmpeg -version
+export PD_RESULTS=/data/logs/glm53-int8-pd-tests/$(date +%Y%m%d-%H%M%S)
+mkdir -p "$PD_RESULTS"
+set -o pipefail
+
+.venv/bin/python examples/disaggregated/glm5next_int8/run_checks.py functional \
+  --output-dir "$PD_RESULTS" \
+  2>&1 | tee "$PD_RESULTS/functional.log"
+```
+
+Functional cases run in this order and stop at the first failure:
+
+| Case | Input | Acceptance |
+| --- | --- | --- |
+| text2k | 2047 tokens | Retrieve all three random secrets |
+| text32k | 32767 tokens | Retrieve secrets near start, middle, end |
+| text128k | 131071 tokens | Same, with exact server token-count check |
+| text512k | 524287 tokens | Same |
+| text1m | 1047551 tokens | Same, reserving 1024 output tokens below 1048576 |
+| image | Red image | Correct color JSON |
+| images | Red and blue images | Correct image order JSON |
+| video_frames | Three JPEG frames via video/jpeg | Red, green, blue in time order |
+| video_mp4 | Nine-second MP4 | Same order, repeated colors collapsed |
+| mixed | Blue image and MP4 in one request | Correct image and video answers |
+
+Text uses the checkpoint chat template and sends exact token IDs to
+`/v1/completions`. Media uses `/v1/chat/completions`. Prompt lengths deliberately
+leave a partial kpool group. Every request gets a unique prefix to avoid
+reusing the long text prefix cache across test requests. These synthetic
+retrieval/color cases verify the execution path; they are not a general model
+quality benchmark or a combined 1M-text-plus-video capacity test.
+
+Each functional case requires a complete streaming response, token usage,
+the expected answer, increasing decoder NIXL byte/count metrics, and unchanged
+transfer/notification failure counters. Raw P/D metrics are saved before and
+after every stage, including available KV-cache and preemption metrics. Metric
+publication is polled for up to 20 seconds. Missing metrics fail acceptance.
+Keep unrelated traffic off these engines during acceptance so metric deltas
+can be attributed to the test. The request timeout defaults to four hours;
+`--timeout` changes it. A pending request does not print incremental progress.
+
+### Performance after acceptance
+
+`perf` requires a complete, successful `functional.json` in the same result
+directory with matching client commit, model, tokenizer path and endpoints.
+Rerun functional acceptance after changing the deployed model, server code or
+cache configuration; the client cannot independently attest remote processes.
+
+First sweep short text and heterogeneous text/media traffic:
+
+```bash
+.venv/bin/python examples/disaggregated/glm5next_int8/run_checks.py perf \
+  --output-dir "$PD_RESULTS" \
+  --cases text2k,text32k,mixed_load \
+  --concurrency 1 2 4 8 16 32 --requests 32 \
+  2>&1 | tee "$PD_RESULTS/perf-short-mixed.log"
+```
+
+Then sweep long context:
+
+```bash
+.venv/bin/python examples/disaggregated/glm5next_int8/run_checks.py perf \
+  --output-dir "$PD_RESULTS" \
+  --cases text128k,text512k,text1m \
+  --concurrency 1 2 4 8 16 32 --requests 16 \
+  2>&1 | tee "$PD_RESULTS/perf-long.log"
+```
+
+Test each media mode independently if needed:
+
+```bash
+.venv/bin/python examples/disaggregated/glm5next_int8/run_checks.py perf \
+  --output-dir "$PD_RESULTS" \
+  --cases image,images,video_frames,video_mp4,mixed \
+  --concurrency 1 2 4 8 16 32 --requests 32 \
+  2>&1 | tee "$PD_RESULTS/perf-media.log"
+```
+
+`mixed_load` cycles 2K text, 32K text, single image, two images, MP4, and an
+image-plus-video request. Each level sends at least the larger of `--requests`
+and four times concurrency, using a closed-loop client with that many requests
+in flight. Requests waiting for a client slot are excluded from per-request
+latency; the full stage duration is used for aggregate throughput. Longer
+sustained runs can increase `--requests`; levels above 32 can be passed directly.
+Large-context, high-concurrency levels can take many hours and substantial
+client RAM because distinct prompts are prepared before the timed interval.
+Performance media also gets a unique small corner pattern per request, changing
+the decoded pixels to avoid measuring repeated-media processor-cache hits.
+Media encoding is outside the timed interval; fixtures remain under
+`assets/STAGE/REQUEST_INDEX` for inspection.
+The client stops the sweep on request or transfer failure, preserving results.
+
+Performance requests use `ignore_eos` and a fixed 256 output tokens (override
+with `--output-tokens`, up to 1024). Performance measures successful transport
+and token production; semantic correctness is checked in the functional run.
+There are no extra warmup requests; the first level includes any remaining
+cold compilation and should be reported separately from repeated steady runs.
+
+Outputs include per-request `*.jsonl`, per-stage `*-summary.json`, raw `*.prom`,
+`functional.json`, and `performance.json`. The last file describes the latest
+sweep; timestamped stage files from earlier sweeps remain intact. Reports give
+successful input/output tokens per second, requests per second, failures, and
+P50/P95/P99 TTFT, TPOT and end-to-end latency in seconds. TPOT is the interval
+from first to last output-bearing stream event divided by output tokens minus
+one; it is not a per-token ITL distribution. One-token responses have no TPOT.
+Failed requests do not contribute to token throughput. Proxy, transfer and
+server queue time are included; monitor client CPU/network utilization too so
+a client bottleneck is not mistaken for server capacity.
+
+Server metrics do not replace hardware measurements. Record `rocm-smi` power,
+utilization and memory on all four hosts during sustained runs. Revenue uses
+successful aggregate throughput, actual input/output prices and measured power
+for all 32 GPUs. This client provides acceptance and load-test evidence; it
+does not turn the toy proxy into a production gateway or verify failover.
+
+CPU-only client regression checks (no server or checkpoint required):
+
+```bash
+.venv/bin/python -m pytest --confcutdir=tests/benchmarks \
+  tests/benchmarks/test_glm53_pd_checks.py -q
+```
