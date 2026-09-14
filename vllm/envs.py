@@ -249,6 +249,7 @@ if TYPE_CHECKING:
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
     VLLM_GLM5NEXT_CHECK_FINITE: bool = False
+    VLLM_GLM5NEXT_DUMP_DIR: str | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1814,6 +1815,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5NEXT_CHECK_FINITE": lambda: bool(
         int(os.getenv("VLLM_GLM5NEXT_CHECK_FINITE", "0"))
     ),
+    # Save failing W8A16 GEMM2 operands when GLM eager finite checks are enabled.
+    "VLLM_GLM5NEXT_DUMP_DIR": lambda: os.getenv("VLLM_GLM5NEXT_DUMP_DIR"),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")

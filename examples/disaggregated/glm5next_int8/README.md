@@ -318,6 +318,31 @@ CPU-only client regression checks (no server or checkpoint required):
 
 ### Repeated output or non-finite logprobs
 
+For a failure at `stage=gemm2 output`, add
+`VLLM_GLM5NEXT_DUMP_DIR=/data/logs/glm53-int8-gemm2` to both D0/D1 launch
+environments alongside the eager finite checks below. On a failing W8A16
+second GEMM, each affected worker saves its actual operands and alignment
+metadata before the existing finite guard aborts. Finite outputs create no
+files. Snapshots contain local expert weights and request activations; keep
+them on the server. This is opt-in diagnostic code, not a numerical fix.
+
+After the failed engine's workers have exited, replay one snapshot on the same
+host (replace the filename with the `GLM GEMM2 capture:` path from its log):
+
+```bash
+/data/vllm/.venv/bin/python /data/vllm/vllm/model_executor/layers/fused_moe/wna16_debug.py /data/logs/glm53-int8-gemm2/gemm2-rank0-pidXXXX-XXXXXXXX.pt --device cuda
+```
+
+This computes a CPU reference and runs the isolated kernel three times on GPU 0,
+without loading the model, starting distributed workers, or using NIXL. To test
+another physical GPU, set `HIP_VISIBLE_DEVICES=4` before the command. Omit
+`--device cuda` for CPU reference only. `--block-size-k 32` (or 64/128) allows
+a controlled tile-size comparison. The report includes original/replay
+non-finite counts, reference results, operand ranges and strides. A finite
+reference with a failing replay implicates the isolated kernel path; a passing
+replay leaves live workspace/lifetime interactions to investigate. Finite
+output alone is not an accuracy pass: inspect numerical differences too.
+
 A completed HTTP request with repetitive output is not a correctness pass.
 Compare a fresh prompt sent directly to D0 with a request through the proxy;
 reusing a prompt can reuse prefix state from an earlier request. A JSON error

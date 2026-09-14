@@ -21,6 +21,64 @@ from vllm.scalar_type import scalar_types
 DEVICE = "cpu"
 
 
+def _wna16_debug():
+    path = Path(__file__).parents[2] / (
+        "vllm/model_executor/layers/fused_moe/wna16_debug.py"
+    )
+    return runpy.run_path(str(path))
+
+
+def _gemm2_call():
+    return dict(
+        A=torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.bfloat16),
+        B=torch.tensor([[[129, 130, 127, 126]]], dtype=torch.uint8),
+        B_scale=torch.tensor([[[2, 0.5]]], dtype=torch.bfloat16),
+        B_zp=None,
+        C=torch.full((1, 2, 1), float("nan"), dtype=torch.bfloat16),
+        topk_weights=torch.tensor([[0.5, 0.25]]),
+        sorted_token_ids=torch.tensor([0, 2, 1, 2], dtype=torch.int32),
+        expert_ids=torch.tensor([0, -1], dtype=torch.int32),
+        num_tokens_post_padded=torch.tensor([4], dtype=torch.int32),
+        mul_routed_weight=True,
+        top_k=1,
+        config={"BLOCK_SIZE_M": 2},
+        block_shape=[0, 2],
+    )
+
+
+def test_wna16_replay_reference_dequantizes_groups_and_zeros_remote_experts():
+    call = _gemm2_call()
+    result = _wna16_debug()["reference"](call)
+    # (1*2 + 2*4 - 3*0.5 - 4*1) * 0.5 = 2.25; remote row = 0.
+    torch.testing.assert_close(result, torch.tensor([[[2.25], [0.0]]]).double())
+
+
+@pytest.mark.parametrize("ids", [[0, 2, 0, 2], [0, 2, 2, 2], [-1, 2, 1, 2]])
+def test_wna16_replay_rejects_invalid_assignment_instead_of_hiding_it(ids):
+    call = _gemm2_call()
+    call["sorted_token_ids"] = torch.tensor(ids, dtype=torch.int32)
+    with pytest.raises(ValueError, match="Duplicate|Missing|Negative"):
+        _wna16_debug()["reference"](call)
+
+
+def test_wna16_failure_capture_is_failure_only_and_preserves_strides(tmp_path):
+    debug = _wna16_debug()
+    call = _gemm2_call()
+    # Preserve a non-contiguous row layout across CPU capture and replay.
+    call["A"] = torch.arange(16, dtype=torch.bfloat16).view(2, 8)[:, :4]
+    path = debug["save_failure"](str(tmp_path), rank=4, module="mlp", **call)
+    saved = torch.load(path, weights_only=True)
+    call["A"].zero_()
+    restored = debug["restore_call"](saved, "cpu")
+    assert restored["A"].stride() == (8, 1)
+    assert restored["A"][1, 0].item() == 8
+    assert saved["rank"] == 4
+    assert torch.isnan(restored["C"]).all()
+    call["C"].zero_()
+    assert debug["save_failure"](str(tmp_path), rank=4, module="mlp", **call) is None
+    assert len(list(tmp_path.glob("*.pt"))) == 1
+
+
 def _finite_checks():
     path = Path(__file__).parents[2] / "vllm/models/glm5next/diagnostics.py"
     return runpy.run_path(str(path))["install_finite_checks"]

@@ -100,6 +100,17 @@ def install_finite_checks(
         setattr(owner, method_name, traced)
 
     def trace_wna16_stages(experts: Any, name: str) -> None:
+        from vllm import envs
+
+        if directory := envs.VLLM_GLM5NEXT_DUMP_DIR:
+            from vllm.model_executor.layers.fused_moe.wna16_debug import save_failure
+
+            def capture(**call):
+                if active():
+                    save_failure(directory, rank=rank, module=name, **call)
+
+            experts._diagnostic_gemm2 = capture
+
         activation_fn = experts.activation
         sum_fn = experts.moe_sum
 

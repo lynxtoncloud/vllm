@@ -762,5 +762,23 @@ class TritonWNA16Experts(TritonExperts):
             block_shape=self.block_shape,
         )
 
+        diagnostic = getattr(self, "_diagnostic_gemm2", None)
+        if diagnostic is not None and self.quant_config.use_int8_w8a16:
+            diagnostic(
+                A=qintermediate_cache2,
+                B=w2,
+                C=intermediate_cache3,
+                B_scale=self.w2_scale,
+                B_zp=self.quant_config.w2_zp,
+                topk_weights=topk_weights,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                mul_routed_weight=not apply_router_weight_on_input,
+                top_k=1,
+                config=config,
+                block_shape=self.block_shape,
+            )
+
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)
