@@ -13,11 +13,14 @@ decoder. This is two engines, not four independent TP8 replicas.
 | D1 | 10.5.10.56 | Decode TP16 | 1 | headless |
 
 The initial profile retains image/video support and uses a 131072-token total
-context limit, four scheduler slots, 512 scheduled tokens per step, chunked
+context limit, vLLM's default scheduler slot count, 512 scheduled tokens per step, chunked
 prefill, and breakable PIECEWISE graphs up to 16 tokens. GPU utilization is 0.90:
 TP16 has more weight headroom than the single-host TP8 test. Maximum concurrency
 at full context depends on the measured KV capacity, not just scheduler slots.
 These settings are a starting point for PD validation, not tuned performance.
+The launcher does not impose a separate concurrency cap unless `MAX_NUM_SEQS`
+is explicitly set. vLLM still schedules requests within its configured limits
+and available KV capacity.
 
 ## Update and check all four hosts
 
@@ -70,6 +73,12 @@ RDMA is available. Transfer failures use the connector's `fail` policy.
 
 ## Start the engines
 
+The launcher uses `python -m vllm.entrypoints.cli.main serve` so that
+`--headless` dispatches follower nodes to the headless multiprocess executor.
+The legacy `python -m vllm.entrypoints.openai.api_server` entrypoint bypasses
+that dispatch and causes `collective_rpc should not be called on follower node`
+on P1/D1.
+
 Run each host's command in a separate persistent terminal. Start P0 and then P1
 without waiting for P0 health; do the same for D0 and D1. Each leader waits for
 its peer to join.
@@ -89,6 +98,12 @@ Logs are saved per host at `/data/logs/glm53-int8-pd-ROLE/latest.log`.
 `MODEL_DIR`, `LOG_DIR`, `MAX_MODEL_LEN`, `MAX_NUM_SEQS`, `MAX_BATCHED_TOKENS`, and
 `GPU_MEMORY_UTILIZATION` are launcher overrides. Keep model/context/cache
 configuration consistent between groups for this first test.
+
+For a 1048576-token context, prefix each host's launch command with
+`MAX_MODEL_LEN=1048576`. Run `unset MAX_NUM_SEQS` first if an earlier test
+exported it; otherwise that explicit concurrency override remains active.
+The limit includes both input and output tokens. Validate the reported KV
+capacity and long-request transfer on both groups before measuring performance.
 
 From another P0 terminal, wait until both return HTTP 200:
 

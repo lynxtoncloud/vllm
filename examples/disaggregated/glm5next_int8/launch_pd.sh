@@ -41,7 +41,7 @@ cmd=(env
   "VLLM_NIXL_SIDE_CHANNEL_PORT=$side_port"
   "GLOO_SOCKET_IFNAME=$iface" "NCCL_SOCKET_IFNAME=$iface"
   VLLM_SSM_CONV_STATE_LAYOUT=DS VLLM_KV_CACHE_LAYOUT=LBHNC
-  .venv/bin/python -m vllm.entrypoints.openai.api_server
+  .venv/bin/python -m vllm.entrypoints.cli.main serve
   --model "$model_dir" --served-model-name glm53-int8
   --host "$node_ip" --port "$port"
   --distributed-executor-backend mp
@@ -52,11 +52,13 @@ cmd=(env
   --no-disable-hybrid-kv-cache-manager
   --quantization compressed-tensors --dtype bfloat16 --kv-cache-dtype auto
   --max-model-len "${MAX_MODEL_LEN:-131072}"
-  --max-num-seqs "${MAX_NUM_SEQS:-4}"
   --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-512}"
   --enable-chunked-prefill
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.90}"
   --compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":16}')
+if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+  cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
+fi
 if [[ "$rank" == 1 ]]; then
   cmd+=(--headless)
 fi
