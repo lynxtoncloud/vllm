@@ -156,6 +156,26 @@ def _uses_dense_virtual_transfer_pages(
     )
 
 
+def _kpool_tail_region(cache: torch.Tensor, num_blocks: int) -> tuple[int, int, int]:
+    """Describe raw K/gate payloads without transferring inter-block padding."""
+    if cache.ndim < 2 or cache.shape[0] != num_blocks or num_blocks == 0:
+        raise ValueError(
+            "NIXL kpool tail requires one tensor row per transfer block: "
+            f"shape={tuple(cache.shape)}, num_blocks={num_blocks}"
+        )
+    if not cache[0].is_contiguous():
+        raise ValueError("NIXL kpool tail requires contiguous data within each block")
+    block_len = cache[0].nbytes
+    block_stride = cache.stride(0) * cache.element_size()
+    storage = cache.untyped_storage()
+    if (
+        block_len > block_stride
+        or _tensor_byte_span_end(cache) > storage.data_ptr() + storage.nbytes()
+    ):
+        raise ValueError("NIXL kpool tail blocks overlap or exceed their storage")
+    return cache.data_ptr(), block_len, block_stride
+
+
 class NixlBaseConnectorWorker:
     """Base implementation of Worker side methods shared by pull and push."""
 
@@ -1347,7 +1367,7 @@ class NixlBaseConnectorWorker:
             )
             base_addr = cache.data_ptr()
             is_mla_region = isinstance(
-                layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+                layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec, KpoolTailSpec)
             )
             logger.debug(
                 "Registering layer %s with cache shape: %s", layer_name, cache.shape
@@ -1414,6 +1434,10 @@ class NixlBaseConnectorWorker:
                 region_specs = [
                     (cache.data_ptr(), block_len, block_stride // physical_ratio)
                 ]
+            elif isinstance(layer_spec, KpoolTailSpec):
+                # Raw K/gate tails are replicated across TP ranks. HMA padding
+                # changes the block pitch, not the payload transferred per block.
+                region_specs = [_kpool_tail_region(cache, num_blocks)]
             else:
                 if cache.ndim == 1:
                     # Flat byte view: HMA tensors shared between layer types carry
