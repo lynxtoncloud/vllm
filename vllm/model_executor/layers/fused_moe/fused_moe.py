@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
+from vllm.triton_utils.tensor_pointer import bounded_tensor_view
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -721,10 +722,17 @@ def invoke_fused_moe_wna16_triton_kernel(
         )
     )
 
+    # ROCm INT8 kernels can miscompile small A/C views of a >2 GiB workspace
+    # when Triton drops pointer_range based on the backing allocation size.
+    # Token/N masks bound accesses to these views in both GEMM1 and GEMM2.
+    a_arg, c_arg = A, C
+    if current_platform.is_rocm() and use_int8_w8a16:
+        a_arg, c_arg = bounded_tensor_view(A), bounded_tensor_view(C)
+
     fused_moe_kernel_gptq_awq[grid](
-        A,
+        a_arg,
         B,
-        C,
+        c_arg,
         B_scale,
         B_zp,
         topk_weights,

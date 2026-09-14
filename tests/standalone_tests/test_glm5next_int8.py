@@ -28,6 +28,11 @@ def _wna16_debug():
     return runpy.run_path(str(path))
 
 
+def _tensor_pointer_utils():
+    path = Path(__file__).parents[2] / "vllm/triton_utils/tensor_pointer.py"
+    return runpy.run_path(str(path))
+
+
 def _gemm2_call():
     return dict(
         A=torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.bfloat16),
@@ -123,7 +128,7 @@ def test_replay_byte_audit_detects_differences_hidden_by_numeric_equality():
 def test_replay_view_pointer_preserves_address_and_bounds_strided_accesses():
     storage = torch.arange(1024, dtype=torch.bfloat16)
     view = storage[32:64].view(4, 8)[:, :3]
-    pointer = _wna16_debug()["ViewPointer"](view)
+    pointer = _tensor_pointer_utils()["TensorView"](view)
     assert pointer.data_ptr() == view.data_ptr()
     assert pointer.size() == view.size()
     assert pointer.stride() == (8, 1)
@@ -133,6 +138,73 @@ def test_replay_view_pointer_preserves_address_and_bounds_strided_accesses():
     assert pointer.ptr_range() < storage.untyped_storage().nbytes()
     view[0, 0] = 17
     assert pointer.tensor[0, 0].item() == 17
+
+
+def test_pointer_bounds_only_specialize_small_views_of_large_storage():
+    utils = _tensor_pointer_utils()
+    bounded = utils["bounded_tensor_view"]
+    # Meta tensors exercise the real storage-size boundary without allocating GiBs.
+    small = torch.empty(2**31 - 1, dtype=torch.uint8, device="meta")
+    small_view = small[:64]
+    assert bounded(small_view) is small_view
+    large = torch.empty(2**31 + 4096, dtype=torch.uint8, device="meta")
+    view = large[32:96]
+    assert bounded(view).tensor is view
+    assert bounded(view).ptr_range() == 64
+    assert bounded(large) is large
+    # Two elements can span more than 2 GiB: numel() is not a sufficient bound.
+    sparse_view = large.as_strided((2,), (2**31,))
+    assert bounded(sparse_view) is sparse_view
+    empty = large[:0]
+    assert bounded(empty) is empty
+    mock = NS(dtype=torch.bfloat16, ptr_range=lambda: 0)
+    assert bounded(mock) is mock
+
+
+@pytest.mark.parametrize("rocm,int8", [(True, True), (True, False), (False, True)])
+def test_wna16_launcher_bounds_only_rocm_int8_workspace_views(rocm, int8):
+    path = Path(__file__).parents[2] / (
+        "vllm/model_executor/layers/fused_moe/fused_moe.py"
+    )
+    fn = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "invoke_fused_moe_wna16_triton_kernel"
+    )
+    captured = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: captured.extend(args)
+
+    namespace = dict(
+        torch=torch,
+        Any=object,
+        tl=NS(dtype=object),
+        current_platform=NS(is_rocm=lambda: rocm),
+        bounded_tensor_view=_tensor_pointer_utils()["bounded_tensor_view"],
+        get_moe_wna16_block_config=lambda **kwargs: {
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+        },
+        fused_moe_kernel_gptq_awq=Kernel(),
+    )
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace)
+    storage = torch.empty(2**31 + 4096, dtype=torch.uint8, device="meta")
+    call = _gemm2_call()
+    call["A"] = storage[:16].view(torch.bfloat16).reshape(2, 4)
+    call["C"] = storage[256:260].view(torch.bfloat16).reshape(1, 2, 1)
+    namespace[fn.name](
+        **call, compute_type=object(), use_int8_w8a16=int8, use_int4_w4a16=not int8
+    )
+    for index, name in ((0, "A"), (2, "C")):
+        if rocm and int8:
+            assert captured[index].tensor is call[name]
+            assert captured[index].ptr_range() == call[name].numel() * 2
+        else:
+            assert captured[index] is call[name]
+    assert captured[1] is call["B"]
 
 
 @pytest.mark.parametrize("int8,isolate", [(True, True), (True, False), (False, True)])

@@ -791,6 +791,68 @@ def test_fused_moe_wn16(
     torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="ROCm pointer specialization"
+)
+@pytest.mark.parametrize("workspace_mib", [1, 2641])
+@pytest.mark.parametrize("top_k", [1, 8])
+def test_w8a16_shared_workspace_pointer_range(workspace_mib, top_k):
+    """GEMM1/2 masked views must compute correctly even in a >2 GiB allocation."""
+    set_random_seed(17)
+    k, n = 2048, 4096
+    source = torch.randn((16 // top_k, k), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    weights = torch.randint(112, 144, (2, n, k), dtype=torch.uint8, device=DEVICE_TYPE)
+    scales = torch.full(
+        (2, n, k // 128), 1 / 128, dtype=torch.bfloat16, device=DEVICE_TYPE
+    )
+    routing = torch.full((2, 8), 1 / 8, device=DEVICE_TYPE)
+    ids = list(range(8)) + [16] * 8
+    ids += list(range(8, 12)) + [16] * 12
+    ids += list(range(12, 16)) + [16] * 12
+    sorted_ids = torch.tensor(ids, dtype=torch.int32, device=DEVICE_TYPE)
+    expert_ids = torch.tensor([0, 1, -1], dtype=torch.int32, device=DEVICE_TYPE)
+    padded = torch.tensor([48], dtype=torch.int32, device=DEVICE_TYPE)
+
+    expected = torch.zeros((16, n), device=DEVICE_TYPE)
+    for expert, start, end in ((0, 0, 8), (1, 8, 12)):
+        rows = torch.arange(start, end, device=DEVICE_TYPE)
+        dequant = ((weights[expert].float() - 128) / 128).to(torch.bfloat16)
+        expected[start:end] = (source[rows // top_k].float() @ dequant.float().T) / 8
+
+    storage = torch.empty(
+        workspace_mib * 1024**2, dtype=torch.uint8, device=DEVICE_TYPE
+    )
+    a_bytes = source.numel() * source.element_size()
+    a = storage[:a_bytes].view(torch.bfloat16).view_as(source)
+    c = storage[65536 : 65536 + 16 * n * 2].view(torch.bfloat16).view(2, 8, n)
+    a.copy_(source)
+    for _ in range(2):
+        c.fill_(float("nan"))
+        fused_moe_module.invoke_fused_moe_wna16_triton_kernel(
+            A=a,
+            B=weights,
+            C=c,
+            B_scale=scales,
+            B_zp=None,
+            topk_weights=routing,
+            sorted_token_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=padded,
+            mul_routed_weight=True,
+            top_k=top_k,
+            config={"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1, "SPLIT_K": 1},
+            compute_type=tl.bfloat16,
+            use_int8_w8a16=True,
+            use_int4_w4a16=False,
+            block_shape=[0, 128],
+        )
+        torch.testing.assert_close(
+            c.view(16, n).float(), expected, atol=2e-2, rtol=2e-2
+        )
+        assert torch.count_nonzero(c.view(16, n)[12:]).item() == 0
+        torch.testing.assert_close(a, source, atol=0, rtol=0)
+
+
 MARLIN_MOE_SCENARIOS = [
     # (m, n, k, e, topk, ep_size)
     # N>=256 required for Marlin kernel thread config for MXFP8.

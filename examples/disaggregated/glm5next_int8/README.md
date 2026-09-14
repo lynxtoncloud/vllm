@@ -366,18 +366,29 @@ launch. This distinguishes restoration, pointer conversion, basic kernel
 access and GEMM2 failures. The audit adds synchronization and allocations;
 compare with ordinary replay if the failure disappears. No serving path changes.
 
-Use `--view-pointer-range` for a compilation-only comparison: A/C keep their
-original allocations, addresses, values and strides, but expose `ptr_range()`
-to Triton HIP using each view's byte span instead of the backing storage size.
-Triton 3.7.1 normally drops the `tt.pointer_range = 32` attribute when a view's
-backing storage exceeds `2**31 - 1` bytes. This option tests that specialization
-without changing buffer reuse. The reported span includes stride gaps; the
-GEMM2 masks must keep accesses inside these views. This is a replay diagnostic,
-not a global override or a serving fix. Compare numerical error, not just NaNs.
+The ROCm INT8 WNA16 launcher now automatically exposes A/C view bounds when
+their backing storage exceeds `2**31 - 1` bytes but their accessed spans do not.
+This applies to GEMM1 and GEMM2 and preserves allocation, addresses, strides
+and reuse. Triton 3.7.1 otherwise drops `tt.pointer_range = 32` based on the
+backing storage size. A captured GLM GEMM2 failed three times in a 2641 MiB
+allocation and matched the independent-allocation reference error three times
+when given view bounds instead. CUDA, INT4, small backing storage and views
+that themselves exceed the bound retain their previous dispatch.
 
-If independent replay passes, test `VLLM_GLM5NEXT_ISOLATE_GEMM2=1` on both
-nodes while keeping the failing context length and other settings fixed.
-This requires the existing `VLLM_GLM5NEXT_CHECK_FINITE=1` eager diagnostics.
+Default GPU replay now exercises this launcher fix: no `--view-pointer-range`
+or isolation flag is needed. The former option remains for explicit compiler
+experiments, using the same TensorView helper. Keep
+`VLLM_GLM5NEXT_ISOLATE_GEMM2` unset when validating the fix in the full model.
+Compare numerical error, not just NaNs. The GPU regression covering both
+GEMMs and remote-expert zero output is:
+
+```bash
+.venv/bin/python -m pytest tests/kernels/moe/test_moe.py -k w8a16_shared_workspace_pointer_range -q
+```
+
+The earlier `VLLM_GLM5NEXT_ISOLATE_GEMM2=1` diagnostic remains available,
+but did not correct the observed 512K model output. It requires
+`VLLM_GLM5NEXT_CHECK_FINITE=1` eager diagnostics.
 It allocates only the INT8 GEMM2 output independently instead of reusing the
 GEMM1 workspace; inputs, weights, launch configuration and reduction stay the
 same. The default is off. This is a diagnostic comparison, not a confirmed

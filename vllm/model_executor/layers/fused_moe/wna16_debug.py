@@ -154,27 +154,6 @@ def same_bits(actual: torch.Tensor, expected: torch.Tensor) -> bool:
     )
 
 
-class ViewPointer:
-    """Report view bounds for GEMM2's masked accesses, retaining the allocation.
-
-    Triton HIP accepts ptr_range() instead of using the entire backing storage.
-    This is valid only when the kernel's accesses stay inside the tensor view.
-    """
-
-    def __init__(self, tensor: torch.Tensor):
-        self.tensor = tensor
-
-    def __getattr__(self, name):
-        return getattr(self.tensor, name)
-
-    def ptr_range(self) -> int:
-        tensor = self.tensor
-        if not tensor.numel():
-            return 0
-        span = 1 + sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride()))
-        return span * tensor.element_size()
-
-
 def audit_workspace(call: dict, original: dict) -> None:
     """Check restored bytes and the pointers actually received by a GPU kernel."""
     from vllm.triton_utils import tl, triton
@@ -335,8 +314,10 @@ def main():
         audit_workspace(replay, call)
     launch = replay.copy()
     if args.view_pointer_range:
+        from vllm.triton_utils.tensor_pointer import TensorView
+
         for name in ("A", "C"):
-            launch[name] = ViewPointer(replay[name])
+            launch[name] = TensorView(replay[name])
         print(
             json.dumps(
                 {
