@@ -55,6 +55,27 @@ logger = init_logger(__name__)
 DSA_INDEXER_KV_DTYPES = ("fp8", "mxfp4")
 
 
+def _reblock_indexer_table(
+    block_table: torch.Tensor,
+    kernel_block_size: int | None,
+    storage_block_size: int,
+) -> torch.Tensor:
+    """Express kernel-page IDs in the indexer's storage-page granularity."""
+    if kernel_block_size is None or kernel_block_size == storage_block_size:
+        return block_table
+    if storage_block_size > kernel_block_size:
+        assert storage_block_size % kernel_block_size == 0
+        factor = storage_block_size // kernel_block_size
+        return (block_table[:, ::factor] // factor).contiguous()
+
+    assert kernel_block_size % storage_block_size == 0
+    factor = kernel_block_size // storage_block_size
+    offsets = torch.arange(factor, dtype=block_table.dtype, device=block_table.device)
+    expanded = block_table.unsqueeze(-1) * factor + offsets
+    expanded.masked_fill_(block_table.unsqueeze(-1) < 0, -1)
+    return expanded.flatten(1)
+
+
 def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
     """Whether the DeepSeek sparse indexer should use the MXFP4 K cache."""
     kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("fp8")
@@ -1176,14 +1197,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_seq_lens = seq_lens
         indexer_block_table = block_table
         if self.compress_ratio > 1:
-            kernel_block_size = self.kernel_block_size
-            if (
-                kernel_block_size is not None
-                and self.kv_cache_spec.block_size != kernel_block_size
-                and self.kv_cache_spec.block_size % kernel_block_size == 0
-            ):
-                factor = self.kv_cache_spec.block_size // kernel_block_size
-                indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
+            indexer_block_table = _reblock_indexer_table(
+                block_table, self.kernel_block_size, self.kv_cache_spec.block_size
+            )
             padded_num_tokens = num_tokens
             if self.pcp_world_size > 1:
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
@@ -1417,11 +1433,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 if (
                     kernel_block_size is not None
                     and self.kv_cache_spec.block_size != kernel_block_size
-                    and self.kv_cache_spec.block_size % kernel_block_size == 0
                 ):
-                    factor = self.kv_cache_spec.block_size // kernel_block_size
-                    compressed = block_table[:, ::factor] // factor
-                    rows, cols = compressed.shape
+                    storage_table = _reblock_indexer_table(
+                        block_table, kernel_block_size, self.kv_cache_spec.block_size
+                    )
+                    rows, cols = storage_table.shape
                     if self.indexer_decode_block_table_buffer is None:
                         self.indexer_decode_block_table_buffer = torch.zeros(
                             (self._max_num_batched_tokens, cols),
@@ -1429,7 +1445,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                             device=self.device,
                         )
                     self.indexer_decode_block_table_buffer[:rows, :cols].copy_(
-                        compressed
+                        storage_table
                     )
                     block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
 

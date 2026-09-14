@@ -103,11 +103,50 @@ def test_rocm_sparse_metadata_without_persistent_kernel_needs_no_aiter(
     assert instance.paged_kv_indices.shape == (4 * 2048,)
 
 
-@pytest.mark.parametrize("block_size", [1, 16, 64])
+def _reblock_indexer_table():
+    path = Path(__file__).parents[2] / "vllm/v1/attention/backends/mla/indexer.py"
+    fn = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_reblock_indexer_table"
+    )
+    ns = {"torch": torch}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    return ns["_reblock_indexer_table"]
+
+
+@pytest.mark.parametrize("source,target", [(640, 128), (128, 640), (128, 128)])
+def test_indexer_reblocking_preserves_physical_token_addresses(source, target):
+    """Prefill writes and decode reads must address the same physical tokens."""
+    coarse = max(source, target)
+    blocks = torch.tensor([[3, 1, 7], [9, 0, 2]], dtype=torch.int32)
+    factor = coarse // source
+    source_table = (
+        blocks.unsqueeze(-1) * factor + torch.arange(factor, dtype=torch.int32)
+    ).flatten(1)
+    target_table = _reblock_indexer_table()(source_table, source, target)
+    positions = torch.arange(3 * coarse)
+    expected = source_table[:, positions // source] * source + positions % source
+    actual = target_table[:, positions // target] * target + positions % target
+    torch.testing.assert_close(actual, expected)
+
+
+def test_indexer_reblocking_preserves_invalid_pages():
+    table = torch.tensor([[2, -1]], dtype=torch.int32)
+    expanded = _reblock_indexer_table()(table, 640, 128)
+    torch.testing.assert_close(
+        expanded,
+        torch.tensor([[10, 11, 12, 13, 14, -1, -1, -1, -1, -1]]).to(torch.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    "block_size,pages_per_block", [(1, 1), (16, 1), (32, 1), (64, 1), (32, 5)]
+)
 @pytest.mark.parametrize("next_n", [1, 3])
 @pytest.mark.parametrize("per_query_lengths", [False, True])
 def test_rocm_decode_logits_read_preshuffled_cache(
-    block_size, next_n, per_query_lengths
+    block_size, pages_per_block, next_n, per_query_lengths
 ):
     """Decode and MTP must agree with logical K despite physical page shuffling."""
     path = Path(__file__).parents[2] / (
@@ -125,9 +164,13 @@ def test_rocm_decode_logits_read_preshuffled_cache(
     )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
     torch.manual_seed(71)
-    dim, heads, num_pages = 128, 2, 4
+    dim, heads = 128, 2
+    # Reproduce the 32K decode failure: 8192 pooled states need 256 small
+    # pages, but the common table has only 205 entries of 640 raw tokens.
+    num_blocks = 205 if pages_per_block > 1 else 4
+    num_pages = num_blocks * pages_per_block
     capacity = num_pages * block_size
-    length = capacity - 1
+    length = 8192 if pages_per_block > 1 else capacity - 1
     keys = torch.randn(capacity, dim).to(torch.float8_e4m3fn)
     scales = torch.rand(capacity) + 0.1
     cache = torch.empty(num_pages, block_size * (dim + 4), dtype=torch.uint8)
@@ -136,7 +179,11 @@ def test_rocm_decode_logits_read_preshuffled_cache(
     if block_size > 1:
         offsets = token // 16 * 16 * dim + d // 16 * 256 + token % 16 * 16 + d % 16
     # Reverse physical pages so the reference also checks the block table.
-    table = torch.arange(num_pages - 1, -1, -1, dtype=torch.int32)
+    common_table = torch.arange(num_blocks - 1, -1, -1, dtype=torch.int32)
+    table = (
+        common_table[:, None] * pages_per_block
+        + torch.arange(pages_per_block, dtype=torch.int32)
+    ).flatten()
     for logical, physical in enumerate(table):
         sl = slice(logical * block_size, (logical + 1) * block_size)
         cache[physical, offsets] = keys[sl].view(torch.uint8)
@@ -154,7 +201,11 @@ def test_rocm_decode_logits_read_preshuffled_cache(
         cache.view(num_pages, block_size, 1, dim + 4),
         weights,
         lens.to(torch.int32),
-        table.repeat(2, 1),
+        _reblock_indexer_table()(
+            common_table.repeat(2, 1),
+            block_size * 4 * pages_per_block,
+            block_size * 4,
+        ),
         capacity,
     )
     expected = torch.full((2 * next_n, capacity), float("-inf"))
