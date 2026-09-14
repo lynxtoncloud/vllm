@@ -149,14 +149,15 @@ def test_wna16_oracle_rejects_incompatible_quant_structures(
     assert expected in reason
 
 
-def test_compressed_tensors_weights_are_transposed_for_triton():
+@pytest.mark.parametrize("num_bits,group_size", [(4, 32), (8, 128)])
+def test_compressed_tensors_weights_are_transposed_for_triton(num_bits, group_size):
     quant_config = QuantizationArgs(
-        num_bits=4,
+        num_bits=num_bits,
         type=QuantizationType.INT,
         strategy=QuantizationStrategy.GROUP,
         symmetric=True,
         dynamic=False,
-        group_size=32,
+        group_size=group_size,
     )
     w13 = torch.arange(16, dtype=torch.int32).reshape(1, 2, 8)
     w2 = torch.arange(12, dtype=torch.int32).reshape(1, 2, 6)

@@ -625,6 +625,7 @@ class Glm5NextModel(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
@@ -800,6 +801,8 @@ class Glm5NextModel(nn.Module):
             kv_a_pad_size = self.config.qk_rope_head_dim
 
         _pending_wk_fp8: dict = {}
+        load_w8a16 = _is_w8a16_g128(self.quant_config)
+        pending_w8a16: dict = {}
 
         for args in weights:
             name, loaded_weight = args[:2]
@@ -813,6 +816,17 @@ class Glm5NextModel(nn.Module):
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
+                continue
+
+            if load_w8a16 and _try_load_w8a16_attention_weight(
+                name,
+                loaded_weight,
+                pending_w8a16,
+                params_dict,
+                loaded_params,
+                stacked_params_mapping,
+                kv_a_pad_size,
+            ):
                 continue
 
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
@@ -927,12 +941,18 @@ class Glm5NextModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        if pending_w8a16:
+            raise ValueError(
+                f"Incomplete W8A16 attention tensors: {sorted(pending_w8a16)}"
+            )
         return loaded_params
 
 
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1029,6 +1049,11 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
 ):
+    packed_modules_mapping = {
+        **Glm4vForConditionalGeneration.packed_modules_mapping,
+        **Glm5NextForCausalLM.packed_modules_mapping,
+    }
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
@@ -1296,4 +1321,98 @@ def _try_load_fp8_attn_proj(
     else:
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
+    return True
+
+
+def _is_w8a16_g128(quant_config: QuantizationConfig | None) -> bool:
+    """Identify the converted checkpoint without imposing device restrictions."""
+    if quant_config is None or quant_config.get_name() != "compressed-tensors":
+        return False
+    if getattr(quant_config, "quant_format", None) != "pack-quantized":
+        return False
+    schemes = getattr(quant_config, "target_scheme_map", {})
+    if not schemes or getattr(quant_config, "transform_config", None):
+        return False
+    for scheme in schemes.values():
+        weight = scheme.get("weights")
+        if (
+            weight is None
+            or weight.num_bits != 8
+            or weight.type != "int"
+            or not weight.symmetric
+            or weight.strategy != "group"
+            or weight.group_size != 128
+            or weight.dynamic
+            or weight.actorder is not None
+            or scheme.get("input_activations") is not None
+            or scheme.get("output_activations") is not None
+            or scheme.get("format") not in (None, "pack-quantized")
+        ):
+            return False
+    return True
+
+
+def _try_load_w8a16_attention_weight(
+    name, tensor, pending, params, loaded, stacked_mapping, kv_a_pad_size=0
+) -> bool:
+    """Load packed attention projections that GLM deliberately keeps unquantized.
+
+    Preserve the existing parameter loaders for TP slicing and fused shards.
+    Quantized Linear and expert parameters continue through the normal loader.
+    """
+    base, _, field = name.rpartition(".")
+    if ".self_attn." not in name or field not in (
+        "weight_packed",
+        "weight_scale",
+        "weight_shape",
+    ):
+        return False
+    target, shard = base + ".weight", None
+    for param_name, weight_name, shard_id in stacked_mapping:
+        mapped = target.replace(weight_name + ".", param_name + ".")
+        if mapped != target and mapped in params:
+            target, shard = mapped, shard_id
+            break
+    if target not in params or params[target].dtype not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        return False
+    entry = pending.setdefault(base, {})
+    if field in entry:
+        raise ValueError(f"Duplicate W8A16 attention tensor: {name}")
+    entry[field] = tensor
+    if len(entry) != 3:
+        return True
+    packed, scales = entry["weight_packed"], entry["weight_scale"]
+    shape = entry["weight_shape"].tolist()
+    if (
+        packed.dtype != torch.int32
+        or packed.ndim != 2
+        or len(shape) != 2
+        or shape != [packed.shape[0], packed.shape[1] * 4]
+        or shape[1] % 128
+        or scales.shape != (shape[0], shape[1] // 128)
+        or scales.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        raise ValueError(f"Invalid W8A16-G128 attention tensors: {base}")
+    weight = torch.empty(shape, device=packed.device, dtype=params[target].dtype)
+    shifts = torch.arange(4, device=packed.device) * 8
+    for start in range(0, shape[0], 128):
+        q = ((packed[start : start + 128, :, None] >> shifts) & 255) - 128
+        q = q.reshape(-1, shape[1] // 128, 128).float()
+        weight[start : start + 128] = (
+            (q * scales[start : start + 128, :, None].float())
+            .reshape(-1, shape[1])
+            .to(weight.dtype)
+        )
+    if kv_a_pad_size and base.endswith(".kv_a_proj_with_mqa"):
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, kv_a_pad_size))
+    param = params[target]
+    if shard is None:
+        param.weight_loader(param, weight)
+    else:
+        param.weight_loader(param, weight, shard)
+    loaded.add(target)
+    del pending[base]
     return True

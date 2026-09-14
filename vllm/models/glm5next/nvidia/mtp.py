@@ -21,16 +21,19 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .model import (
     Glm5NextDecoderLayer,
+    Glm5NextForCausalLM,
     Glm5NextMLAAttention,
     Glm5NextMoE,
+    _is_w8a16_g128,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    _try_load_w8a16_attention_weight,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
@@ -208,6 +211,11 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = Glm5NextForCausalLM.packed_modules_mapping
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.language_model.": "model."}
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -309,6 +317,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}
+        load_w8a16 = _is_w8a16_g128(self.quant_config)
+        pending_w8a16: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
         kv_a_pad_size = 0
@@ -327,6 +337,17 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             if spec_layer is None:
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
+
+            if load_w8a16 and _try_load_w8a16_attention_weight(
+                name,
+                loaded_weight,
+                pending_w8a16,
+                params_dict,
+                loaded_params,
+                stacked_params_mapping,
+                kv_a_pad_size,
+            ):
+                continue
 
             if _try_load_fp8_indexer_wk(
                 name,
@@ -413,6 +434,10 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        if pending_w8a16:
+            raise ValueError(
+                f"Incomplete W8A16 attention tensors: {sorted(pending_w8a16)}"
+            )
         loaded_layers: set[int] = set()
         for param_name in loaded_params:
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)

@@ -717,6 +717,42 @@ def test_find_matched_target_returns_none_on_no_match():
     assert result is None
 
 
+@pytest.mark.parametrize("model_type", ["text", "multimodal", "mtp"])
+@pytest.mark.parametrize("mlp", ["mlp", "mlp.shared_experts"])
+def test_glm5next_w8a16_exact_targets_match_fused_mlp(model_type, mlp):
+    """Converted gate/up targets must not silently create a BF16 fused layer."""
+    from vllm.models.glm5next.nvidia.model import (
+        Glm5NextForCausalLM,
+        Glm5NextForConditionalGeneration,
+    )
+    from vllm.models.glm5next.nvidia.mtp import Glm5NextMTP
+
+    model_cls = {
+        "text": Glm5NextForCausalLM,
+        "multimodal": Glm5NextForConditionalGeneration,
+        "mtp": Glm5NextMTP,
+    }[model_type]
+    checkpoint_prefix = "model" if model_type == "text" else "model.language_model"
+    runtime_prefix = "language_model.model" if model_type == "multimodal" else "model"
+    config = _make_ct_config()
+    scheme_dict = config.target_scheme_map["Linear"]
+    scheme_dict["weights"] = QuantizationArgs(
+        num_bits=8, type="int", strategy="group", group_size=128, symmetric=True
+    )
+    config.target_scheme_map = {
+        f"{checkpoint_prefix}.layers.0.{mlp}.{proj}": scheme_dict
+        for proj in ("gate_proj", "up_proj")
+    }
+    config.packed_modules_mapping = model_cls.packed_modules_mapping
+    if model_type != "text":
+        config.apply_vllm_mapper(model_cls.hf_to_vllm_mapper.get_rename_mapper())
+    scheme = config.get_scheme(
+        Mock(spec=torch.nn.Linear), f"{runtime_prefix}.layers.0.{mlp}.gate_up_proj"
+    )
+    assert isinstance(scheme, CompressedTensorsWNA16)
+    assert scheme.num_bits == 8 and scheme.group_size == 128
+
+
 def test_get_scheme_dict_returns_none_on_no_match():
     config = _make_ct_config(target="matched_layer")
     result = config.get_scheme_dict(
