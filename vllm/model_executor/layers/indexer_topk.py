@@ -21,14 +21,15 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 # Matches the -1 fill convention used for topk_indices_buffer elsewhere.
 IDX_OOB_FILL_VALUE = -1
 
-try:
-    import vllm._deepselect_C  # noqa: F401  (registers torch.ops.deep_select)
-except ImportError as e:
-    from vllm.logger import init_logger
+if current_platform.is_cuda():
+    try:
+        import vllm._deepselect_C  # noqa: F401  (registers torch.ops.deep_select)
+    except ImportError as e:
+        from vllm.logger import init_logger
 
-    init_logger(__name__).warning(
-        "Failed to import the DeepSelect extension (vllm._deepselect_C): %s", e
-    )
+        init_logger(__name__).warning(
+            "Failed to import the DeepSelect extension (vllm._deepselect_C): %s", e
+        )
 
 
 @functools.lru_cache(maxsize=1)
