@@ -95,6 +95,76 @@ def test_production_gpu_gate_surfaces_compiler_failure(monkeypatch, tmp_path):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("drop_marker", [False, True])
+def test_pd_diagnostic_audits_actual_decoded_needles(
+    monkeypatch, tmp_path, drop_marker
+):
+    _assessment(monkeypatch, "suite")
+    diagnostic = importlib.import_module("diagnose_text_pd")
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return "<user>" + messages[0]["content"] + "<assistant>"
+
+        def encode(self, text, **kwargs):
+            return list(map(ord, text))
+
+        def decode(self, ids, **kwargs):
+            text = "".join(map(chr, ids))
+            return text.replace("audit-middle", "missing") if drop_marker else text
+
+    if drop_marker:
+        with pytest.raises(ValueError, match="lost/duplicated"):
+            diagnostic.prepare_input(Tokenizer(), 2047, "audit", tmp_path)
+    else:
+        ids, audit = diagnostic.prepare_input(Tokenizer(), 2047, "audit", tmp_path)
+        assert json.loads((tmp_path / "prompt-ids.json").read_text()) == ids
+        assert len(ids) == 2047
+        assert all(m["count"] == 1 for m in audit["markers"].values())
+        offsets = [m["character_offset"] for m in audit["markers"].values()]
+        assert offsets == sorted(offsets)
+
+
+def test_pd_diagnostic_compares_identical_input_without_cross_route_cache(
+    monkeypatch, tmp_path
+):
+    import asyncio
+
+    _assessment(monkeypatch, "suite")
+    diagnostic = importlib.import_module("diagnose_text_pd")
+    calls = []
+    audit = {"sha256": "same-input", "expected": {"start": "found"}}
+
+    async def request(client, url, endpoint, payload, timeout):
+        calls.append((url, payload))
+        # PD fails semantically; all routes must still be saved for comparison.
+        text = '{"start":"wrong"}' if url.endswith(":8000") else '{"start":"found"}'
+        return dict(success=True, text=text, input_tokens=3, finish_reasons=["stop"])
+
+    async def snapshot(*args):
+        return {"metric": 1}
+
+    async def sleep(*args):
+        pass
+
+    monkeypatch.setattr(diagnostic, "request", request)
+    monkeypatch.setattr(diagnostic, "snapshot", snapshot)
+    monkeypatch.setattr(diagnostic, "transfer_ok", lambda *a: True)
+    monkeypatch.setattr(diagnostic.asyncio, "sleep", sleep)
+    cfg = {"nodes": {"p0": "p", "d0": "d"}, "model_name": "model"}
+    asyncio.run(diagnostic.compare(cfg, [1, 2, 3], audit, tmp_path))
+    assert [url for url, _ in calls] == [
+        "http://p:8001",
+        "http://d:8002",
+        "http://p:8000",
+    ]
+    assert all(payload["prompt"] == [1, 2, 3] for _, payload in calls)
+    assert len({payload["cache_salt"] for _, payload in calls}) == 3
+    results = json.loads((tmp_path / "results.json").read_text())
+    assert [row["passed"] for row in results] == [True, True, False]
+    assert json.loads((tmp_path / "progress.json").read_text())["all_passed"] is False
+
+
 def test_w8a16_tuning_rejects_wrong_device_and_invalid_tiles(tmp_path):
     import functools
 

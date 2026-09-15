@@ -181,6 +181,7 @@ async def request(client, base_url, endpoint, payload, timeout):
     text = ""
     usage = None
     finished = False
+    finish_reasons = []
     done = False
     result = {"success": False}
 
@@ -220,7 +221,9 @@ async def request(client, base_url, endpoint, payload, timeout):
                         if first is None:
                             first = last
                     text += content
-                    finished |= choice.get("finish_reason") is not None
+                    if choice.get("finish_reason") is not None:
+                        finish_reasons.append(choice["finish_reason"])
+                        finished = True
 
     try:
         await asyncio.wait_for(consume(), timeout=timeout)
@@ -238,7 +241,9 @@ async def request(client, base_url, endpoint, payload, timeout):
         )
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"
-    result.update(e2e_s=time.perf_counter() - start, text=text)
+    result.update(
+        e2e_s=time.perf_counter() - start, text=text, finish_reasons=finish_reasons
+    )
     return result
 
 
