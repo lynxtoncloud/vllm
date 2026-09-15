@@ -77,6 +77,24 @@ def test_production_gpu_gate_rejects_skipped_or_empty_results(
             production.qualify_kernels({"repo": str(tmp_path)}, tmp_path)
 
 
+def test_production_gpu_gate_surfaces_compiler_failure(monkeypatch, tmp_path):
+    """A failed GPU test must expose its diagnostics and stop qualification."""
+    _assessment(monkeypatch, "suite")
+    production = importlib.import_module("production_assessment")
+    calls = []
+
+    def execute(cmd, **kwargs):
+        calls.append(cmd)
+        kwargs["stdout"].write("CompilationError: cannot cast int32 to fp8e4nv\n")
+        raise production.subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(production.subprocess, "run", execute)
+    with pytest.raises(RuntimeError, match="CompilationError: cannot cast") as error:
+        production.qualify_kernels({"repo": str(tmp_path)}, tmp_path)
+    assert str(tmp_path / "indexer-qualification.log") in str(error.value)
+    assert len(calls) == 1
+
+
 def test_w8a16_tuning_rejects_wrong_device_and_invalid_tiles(tmp_path):
     import functools
 

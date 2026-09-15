@@ -63,10 +63,11 @@ def _mqa_logits(
         end = tl.load(LENGTHS + row * lens_col)
     valid = (keys < N) & (keys >= start) & (keys < end)
     if tl.sum(valid.to(tl.int32), axis=0) > 0:
+        # FP8 masked loads require floating-point padding (int -> FP8 is invalid).
         query = tl.load(
             Q + row.to(tl.int64) * q_row + h[:, None] * q_head + d[None, :] * q_dim,
             (h[:, None] < H) & (d[None, :] < D),
-            other=0,
+            other=0.0,
         ).to(tl.bfloat16)
         if PAGED:
             valid = valid & (keys < TABLE_COLS * PAGE)
@@ -90,7 +91,7 @@ def _mqa_logits(
             value = tl.load(
                 K + page[None, :] * k_row + offset,
                 valid[None, :] & (d[:, None] < D),
-                other=0,
+                other=0.0,
             ).to(tl.bfloat16)
             scale = tl.load(
                 S + page * (k_row // 4) + PAGE * D // 4 + token,
@@ -101,7 +102,7 @@ def _mqa_logits(
             value = tl.load(
                 K + keys[None, :].to(tl.int64) * k_row + d[:, None] * k_dim,
                 valid[None, :] & (d[:, None] < D),
-                other=0,
+                other=0.0,
             ).to(tl.bfloat16)
             scale = tl.load(S + keys * scale_row, valid, other=0)
         scores = tl.dot(query, value)

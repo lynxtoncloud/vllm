@@ -149,15 +149,23 @@ def qualify_kernels(cfg, out):
         ]
         if expression:
             cmd += ["-k", expression]
-        with (out / f"{name}-qualification.log").open("w") as log:
-            subprocess.run(
-                cmd,
-                cwd=cfg["repo"],
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=True,
-            )
+        log_path = out / f"{name}-qualification.log"
+        try:
+            with log_path.open("w") as log:
+                subprocess.run(
+                    cmd,
+                    cwd=cfg["repo"],
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            tail = log_path.read_text(errors="replace")[-12000:]
+            raise RuntimeError(
+                f"GPU qualification failed: {name} (exit {exc.returncode}). "
+                f"Full log: {log_path}\n{tail}"
+            ) from exc
         cases = list(ET.parse(xml_path).iter("testcase"))
         if not cases or any(
             len(case)
