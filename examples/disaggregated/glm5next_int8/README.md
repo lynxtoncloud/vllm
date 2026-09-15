@@ -512,6 +512,6 @@ The remaining deployment acceptance items are:
 
 ## Background full assessment
 
-See [the P1-managed full assessment guide](ASSESSMENT.md) for detached shell-session
+See [the P0-managed full assessment guide](ASSESSMENT.md) for detached shell-session
 jobs, per-stage resume, 1M and multimodal tests, four-host monitoring and reports.
 It does not use systemd or create server worktrees.

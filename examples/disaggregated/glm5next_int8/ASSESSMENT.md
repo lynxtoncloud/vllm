@@ -1,7 +1,7 @@
-# 四节点后台全量测试（在P1管理，不用systemd）
+# 四节点后台全量测试（在P0管理，不用systemd）
 
 拓扑是P0+P1一个TP16 Prefill引擎，D0+D1一个TP16 Decode引擎。
-管理脚本在P1运行，通过密钥SSH执行远端启停；测试客户端也在P1。
+管理脚本在P0运行，通过密钥SSH执行远端启停；测试客户端也在P0。
 每个任务独立session、stdin关闭、stdout/stderr落盘并忽略SIGHUP。
 关闭终端不会停止任务；主机重启不会自动恢复，需手工start。
 
@@ -9,14 +9,14 @@
 
 四台使用同一个 `gfx1100/glm5next-int8` 分支、提交和模型文件。
 现有服务若由旧命令启动，先用原方式停止并核实显存释放；本管理器不接管、
-不批量杀死旧进程。P1需有 `/root/.ssh/rebond.pem`，且能登录另外三台。
-以下命令由用户在P1执行，不新建clone/worktree：
+不批量杀死旧进程。P0需有 `/root/.ssh/rebond.pem`，且能登录另外三台。
+以下命令由用户在P0执行，不新建clone/worktree：
 
 ```bash
 cd /data/vllm
 git switch gfx1100/glm5next-int8
 git pull --ff-only
-for host in 10.5.10.36 10.5.10.55 10.5.10.56; do
+for host in 10.5.10.3 10.5.10.55 10.5.10.56; do
   ssh -p 21985 -i ~/.ssh/rebond.pem "root@$host" \
     'cd /data/vllm && git switch gfx1100/glm5next-int8 && git pull --ff-only && git log -1 --oneline' || break
 done
@@ -26,7 +26,7 @@ apt-get update && apt-get install -y ffmpeg
 ffmpeg -hide_banner -encoders 2>/dev/null | grep libx264
 ```
 
-`ffmpeg/libx264`用于P1生成视频；监控只需Python标准库、Linux/proc/sysfs。
+`ffmpeg/libx264`用于P0生成视频；监控只需Python标准库、Linux/proc/sysfs。
 可在各节点安装 `ethtool rdma-core ipmitool` 丰富网卡/BMC信息，缺失命令会
 记录为不可用，不把缺失功耗当0。BMC不支持DCMI时，需另行记录机柜电表功耗。
 核对各节点时钟同步，否则跨节点窗口对齐不可信。
@@ -36,11 +36,11 @@ ffmpeg -hide_banner -encoders 2>/dev/null | grep libx264
 不设置额外 `max-num-seqs`。可修改配置中的批处理/graph参数，但每次配置或
 代码变化必须使用新的RUN_ID，不能与原结果混算。
 配置中的LD_LIBRARY_PATH会覆盖继承值；如有额外依赖路径请明确填入配置。
-代理绑定P0内网地址10.5.10.36:8000，供P1访问。
+代理绑定P0内网地址10.5.10.36:8000，供P0访问。
 
 ## 启动、状态、停止
 
-所有命令都在P1执行。每次重新登录后，重新设置下面三个变量即可：
+所有命令都在P0执行。每次重新登录后，重新设置下面三个变量即可：
 
 ```bash
 cd /data/vllm
@@ -70,7 +70,7 @@ curl --noproxy '*' --fail --max-time 30 http://10.5.10.36:8000/healthcheck
 ```bash
 # 查看当前阶段、进程和退出码。
 .venv/bin/python "$GLM_ASSESS_JOB" status all --run-id "$GLM_ASSESS_RUN"
-tail -n 80 -f "$GLM_ASSESS_ROOT/p1/test/console.log"
+tail -n 80 -f "$GLM_ASSESS_ROOT/p0/test/console.log"
 
 # 暂停压测，保留服务与监控。
 .venv/bin/python "$GLM_ASSESS_JOB" stop test --run-id "$GLM_ASSESS_RUN"
@@ -113,16 +113,51 @@ TERM，再清理未退出的同组进程。不会使用pkill或重置GPU。
 如果要先完成一轮覆盖，可显式把concurrency改为[1,2,4]并使用新RUN_ID；
 脚本不会自行跳过1M或降低并发。
 
+## 显存检查与残留worker清理
+
+仍然全部在P0操作。`start engines`会先检查四节点，再逐节点启动；显存不足
+时不会继续加载新模型。`stop engines`后自动复查，但不会自动杀死其他程序。
+
+```bash
+.venv/bin/python "$GLM_ASSESS_JOB" gpu-check engines --run-id "$GLM_ASSESS_RUN"
+
+# 默认仅清理有脚本记录、原session leader已退出的孤儿GPU worker。
+.venv/bin/python "$GLM_ASSESS_JOB" gpu-clean engines --run-id "$GLM_ASSESS_RUN"
+
+# 也可只检查P1或D0等单个节点。
+.venv/bin/python "$GLM_ASSESS_JOB" gpu-check engines --only-role p1 --run-id "$GLM_ASSESS_RUN"
+```
+
+对于旧手工启动的残留进程，检查输出会显示 `legacy_orphan=True`，但默认不杀。
+确认输出中的PID后，在P0使用下面的格式（12345/12346必须替换成当前检查出的PID）：
+
+```bash
+.venv/bin/python "$GLM_ASSESS_JOB" gpu-clean engines --only-role p1 \
+  --pids 12345 12346 --run-id "$GLM_ASSESS_RUN"
+```
+
+指定PID也必须是同一repo工作目录、PPID=1、持有GPU设备句柄的VLLM worker，
+且不属于仍存活的已管理引擎session。清理前复核启动tick、boot ID与进程身份，
+通过pidfd发TERM，5秒未退出再KILL，最后检查显存。非孤儿、其他程序或身份变化
+一律跳过。不会批量pkill、重置GPU或卸载驱动。
+
+每张卡显示PCI位置、已用/可用显存和启动要求，并列出 `/dev/kfd`、`/dev/dri/`
+句柄持有者。未绑定GPU上下文的监控agent也可能持有这些句柄；不因持有句柄而杀进程。
+启动要求按total×GPU_MEMORY_UTILIZATION估算；这不是实际HIP可用显存或模型
+容量验证。`ready=True`只表示sysfs估算容量够启动，不表示显存占用完全为0。
+不足、清理跳过或进程仍在会返回非零；若无进程但显存仍大量占用，保留结果排查驱动。
+详细前后数据保存在本轮各节点 `gpu-checks/`。
+
 ## 采样及报告
 
 每节点每10秒记录GPU忙碌/显存/温度/功耗、CPU/内存/压力/磁盘计数、各NIC
 收发/丢包/错误、各RDMA端口数据量与硬件计数。每分钟记录进程、socket、
 近期内核信息和本机BMC功耗（若支持）。不调用torch，不占用GPU推理显存。
-P1同时是TP节点和压测客户端，客户端CPU负载也会记录；若P1先饱和，后续
+P0同时是TP节点和压测客户端，客户端CPU负载也会记录；若P0先饱和，后续
 应将客户端移到独立机器复核，不把客户端瓶颈归因于GPU。
 
 ```bash
-# 在P1收集其余三台；P1数据直接使用原目录。运行中收集可能不完整，应标为中间报告。
+# 在P0收集其余三台；P0数据直接使用原目录。运行中收集可能不完整，应标为中间报告。
 .venv/bin/python "$GLM_ASSESS_JOB" collect all --run-id "$GLM_ASSESS_RUN"
 .venv/bin/python examples/disaggregated/glm5next_int8/assessment_report.py \
   "$GLM_ASSESS_ROOT" --hours 10 --input-price 0.8 --output-price 2.8
@@ -141,8 +176,8 @@ TPOT联动分析。报告不把bond、物理口、RDMA重复相加。
 ## 链路基线（可选，和模型压测分开执行）
 
 在装有iperf3的节点上测TCP基线可发现明显链路异常，但不能证明ROCm RDMA正常。
-例如D0前台运行 `iperf3 -s -1 -p 5201`，P1运行
-`iperf3 -c 10.5.10.55 -p 5201 -P 4 -t 30 -J > iperf-p1-d0.json`。
+例如D0前台运行 `iperf3 -s -1 -p 5201`，P0运行
+`iperf3 -c 10.5.10.55 -p 5201 -P 4 -t 30 -J > iperf-p0-d0.json`。
 测试反向时重新启动一次服务端，客户端加 `-R`。
 不要在正式模型压测期间混跑iperf3，也不要据TCP结果替代NIXL/GPU转移结果。
 

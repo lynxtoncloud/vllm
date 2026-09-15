@@ -41,6 +41,120 @@ def test_assessment_stop_rejects_reused_pid_and_previous_boot(monkeypatch):
     assert not jobs.owned(state)
 
 
+def test_assessment_gpu_cleanup_only_selects_owned_or_explicit_orphans(monkeypatch):
+    gpu = _assessment(monkeypatch, "gpu")
+    jobs = _assessment(monkeypatch, "jobs")
+    monkeypatch.setattr(jobs, "identity", lambda pid: None)
+    cfg = {"repo": "/data/vllm"}
+    proc = dict(
+        pid=100,
+        ppid=1,
+        state="S",
+        comm="VLLM::Worker_TP",
+        cwd="/data/vllm",
+        devices=["/dev/kfd"],
+        session=42,
+        boot_id="boot",
+        start_ticks="101",
+    )
+    records = [dict(pid=42, boot_id="boot", start_ticks="100")]
+    assert gpu.eligible(proc, cfg, records)
+    assert not gpu.eligible(proc, cfg, [])
+    assert gpu.eligible(proc, cfg, [], explicit=True)
+    changes: list[dict[str, object]] = [
+        {"ppid": 41},
+        {"comm": "python"},
+        {"devices": []},
+        {"cwd": "/data/other-model"},
+    ]
+    for change in changes:
+        assert not gpu.eligible(proc | change, cfg, records, explicit=True)
+    monkeypatch.setattr(jobs, "identity", lambda pid: {"state": "S"})
+    assert not gpu.eligible(proc, cfg, records)
+    assert not gpu.eligible(proc, cfg, records, explicit=True)
+
+
+@pytest.mark.parametrize("reused", [True, False])
+def test_assessment_gpu_pidfd_recheck_and_signal_escalation(monkeypatch, reused):
+    gpu = _assessment(monkeypatch, "gpu")
+    jobs = _assessment(monkeypatch, "jobs")
+    proc = dict(
+        pid=100,
+        ppid=1,
+        state="S",
+        comm="VLLM::Worker_TP",
+        cwd="/data/vllm",
+        devices=["/dev/kfd"],
+        session=42,
+        boot_id="boot",
+        start_ticks="101",
+    )
+    monkeypatch.setattr(jobs, "identity", lambda pid: None)
+    monkeypatch.setattr(
+        gpu, "process", lambda pid: proc | {"start_ticks": "102" if reused else "101"}
+    )
+    monkeypatch.setattr(gpu.os, "pidfd_open", lambda pid: 999, raising=False)
+    monkeypatch.setattr(gpu.os, "close", lambda fd: None)
+    sent = []
+    monkeypatch.setattr(
+        gpu.signal, "pidfd_send_signal", lambda fd, sig: sent.append(sig), raising=False
+    )
+    polls = iter(([], [(999, 1)]))
+    monkeypatch.setattr(
+        gpu.select,
+        "poll",
+        lambda: NS(register=lambda *a: None, poll=lambda timeout: next(polls)),
+        raising=False,
+    )
+    monkeypatch.setattr(gpu.select, "POLLIN", 1, raising=False)
+    result = gpu.release(proc, {"repo": "/data/vllm"}, explicit=True)
+    if reused:
+        assert sent == [] and "error" in result
+    else:
+        assert sent == [gpu.signal.SIGTERM, gpu.signal.SIGKILL]
+        assert result["result"] == "exited_after_KILL"
+
+
+def test_assessment_p0_checks_all_nodes_before_starting_any_engine(
+    monkeypatch, tmp_path
+):
+    import sys
+
+    jobs = _assessment(monkeypatch, "jobs")
+    cfg = json.loads(
+        (Path(jobs.__file__).parent / "assessment_config.json").read_text()
+    )
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(cfg))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["jobs", "start", "engines", "--run-id", "test", "--config", str(path)],
+    )
+    monkeypatch.setattr(
+        jobs.subprocess,
+        "check_output",
+        lambda cmd, **kw: (
+            json.dumps([{"addr_info": [{"local": cfg["nodes"]["p0"]}]}])
+            if cmd[0] == "ip"
+            else "commit"
+        ),
+    )
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return NS(returncode=1 if any(part == "root@10.5.10.3" for part in cmd) else 0)
+
+    monkeypatch.setattr(jobs.subprocess, "run", run)
+    with pytest.raises(SystemExit, match="Failed targets"):
+        jobs.main()
+    assert len(calls) == 4
+    assert calls[0][0].endswith("/.venv/bin/python")
+    assert all("gpu-check" in " ".join(cmd) for cmd in calls)
+    assert jobs.KINDS["test"] == ("test", ("p0",))
+
+
 def test_assessment_energy_uses_host_power_and_does_not_double_count_gpu(monkeypatch):
     report = _assessment(monkeypatch, "report")
     samples = [
@@ -70,7 +184,7 @@ def test_assessment_report_reconciles_four_host_energy_and_revenue(
     folder = Path(report.__file__).parent
     cfg = json.loads((folder / "assessment_config.json").read_text())
     cfg.update(cases=["text2k"], concurrency=[1])
-    data = tmp_path / "p1/test/data"
+    data = tmp_path / "p0/test/data"
     data.mkdir(parents=True)
     (data / "manifest.json").write_text(json.dumps({"config": cfg}))
     stage = dict(

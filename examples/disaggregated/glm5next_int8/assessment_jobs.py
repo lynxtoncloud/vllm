@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Detached jobs with explicit start/stop/status; cluster commands run on P1."""
+"""Detached jobs with explicit start/stop/status; cluster commands run on P0."""
 
 import argparse
 import fcntl
@@ -21,7 +21,7 @@ KINDS = {
     "engines": ("engine", ("p0", "p1", "d0", "d1")),
     "monitors": ("monitor", ("p0", "p1", "d0", "d1")),
     "proxy": ("proxy", ("p0",)),
-    "test": ("test", ("p1",)),
+    "test": ("test", ("p0",)),
 }
 
 
@@ -157,6 +157,14 @@ def local(cfg, args):
     root = Path(cfg["log_root"]) / args.run_id / args.role
     directory = root / args.kind
     directory.mkdir(parents=True, exist_ok=True)
+    if args.action in ("gpu-check", "gpu-clean"):
+        from assessment_gpu import run
+
+        if not run(cfg, args.role, args.action, args.pids, root / "gpu-checks"):
+            raise SystemExit(
+                "VRAM insufficient, ownership unresolved or cleanup incomplete"
+            )
+        return
     if args.action == "worker":
         worker(cfg, args, directory)
         return
@@ -191,6 +199,11 @@ def local(cfg, args):
                 if owned(state):
                     os.killpg(state["pid"], signal.SIGKILL)
             print(f"Stopped/absent: {args.role}/{args.kind} {args.run_id}")
+            if args.kind == "engine":
+                from assessment_gpu import run
+
+                if not run(cfg, args.role, "gpu-check", [], root / "gpu-checks"):
+                    raise SystemExit("Managed job stopped; VRAM still insufficient")
             return
         for old in Path(cfg["log_root"]).glob(f"*/{args.role}/{args.kind}/state.json"):
             if owned(json.loads(old.read_text())):
@@ -200,9 +213,14 @@ def local(cfg, args):
             ["git", "-C", cfg["repo"], "rev-parse", "HEAD"], text=True
         ).strip()
         if current_commit != cfg.get("expected_commit", current_commit):
-            raise RuntimeError(f"Code differs from P1: {current_commit}")
+            raise RuntimeError(f"Code differs from P0: {current_commit}")
         if config_path.exists() and json.loads(config_path.read_text()) != cfg:
             raise ValueError("Configuration changed; use a new run ID")
+        if args.kind == "engine":
+            from assessment_gpu import run
+
+            if not run(cfg, args.role, "gpu-check", [], root / "gpu-checks"):
+                raise RuntimeError("VRAM check failed; inspect owners before starting")
         write_json(config_path, cfg)
         cmd = [
             sys.executable,
@@ -243,18 +261,31 @@ def local(cfg, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=("start", "stop", "status", "collect", "worker")
+        "action",
+        choices=(
+            "start",
+            "stop",
+            "status",
+            "collect",
+            "worker",
+            "gpu-check",
+            "gpu-clean",
+        ),
     )
     parser.add_argument("kind", choices=(*KINDS, "all", "engine", "monitor"))
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--config", type=Path, default=HERE / "assessment_config.json")
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--role", choices=("p0", "p1", "d0", "d1"))
+    parser.add_argument("--only-role", choices=("p0", "p1", "d0", "d1"))
+    parser.add_argument("--pids", type=int, nargs="+", default=[])
     args = parser.parse_args()
+    if any(pid <= 1 for pid in args.pids):
+        parser.error("Worker PIDs must be > 1")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id):
         parser.error("run-id must contain only letters, digits, _ and -")
     cfg = json.loads(args.config.read_text())
-    expected_role = args.role if args.local else "p1"
+    expected_role = args.role if args.local else "p0"
     addresses = json.loads(
         subprocess.check_output(["ip", "-j", "-4", "addr"], text=True)
     )
@@ -270,6 +301,10 @@ def main():
             parser.error("Local command needs --role and a singular job kind")
         local(cfg, args)
         return
+    if args.action.startswith("gpu-") and args.kind != "engines":
+        parser.error("Use gpu-check/gpu-clean engines")
+    if args.pids and (args.action != "gpu-clean" or not args.only_role):
+        parser.error("Explicit PIDs require gpu-clean engines --only-role NODE")
     if args.action == "worker" or args.kind in ("engine", "monitor"):
         parser.error("Use engines/monitors for cluster operations")
     if args.action == "start" and args.kind == "all":
@@ -303,7 +338,7 @@ def main():
         destination = Path(cfg["log_root"]) / args.run_id / "collected"
         destination.mkdir(parents=True, exist_ok=True)
         for role, host in cfg["nodes"].items():
-            if role == "p1":
+            if role == "p0":
                 continue
             source = f"{cfg['log_root']}/{args.run_id}/{role}"
             with (destination / f"{role}.tar").open("wb") as out:
@@ -317,35 +352,46 @@ def main():
                 )
             if result.returncode:
                 errors.append(role)
-        print(f"Archives: {destination}; P1 data: {destination.parent / 'p1'}")
+        print(f"Archives: {destination}; P0 data: {destination.parent / 'p0'}")
     else:
-        for group in groups:
-            kind, roles = KINDS[group]
-            for role in roles:
-                cmd = [
-                    f"{cfg['repo']}/.venv/bin/python",
-                    remote_script,
-                    args.action,
-                    kind,
-                    "--local",
-                    "--role",
-                    role,
-                    "--run-id",
-                    args.run_id,
-                    "--config",
-                    "-",
-                ]
-                # Send the controller's configuration; no remote shell interpolation.
-                if role == "p1":
-                    target = cmd
-                else:
-                    target = ssh + [
-                        f"{cfg['ssh_user']}@{cfg['nodes'][role]}",
-                        shlex.join(cmd),
+        phases = (
+            ("gpu-check", "start")
+            if args.action == "start" and args.kind == "engines"
+            else (args.action,)
+        )
+        for phase in phases:
+            for group in groups:
+                kind, roles = KINDS[group]
+                for role in roles:
+                    if args.only_role and role != args.only_role:
+                        continue
+                    cmd = [
+                        f"{cfg['repo']}/.venv/bin/python",
+                        remote_script,
+                        phase,
+                        kind,
+                        "--local",
+                        "--role",
+                        role,
+                        "--run-id",
+                        args.run_id,
+                        "--config",
+                        "-",
                     ]
-                result = subprocess.run(target, input=json.dumps(cfg), text=True)
-                if result.returncode:
-                    errors.append(f"{role}/{kind}")
+                    if args.pids:
+                        cmd.extend(["--pids", *map(str, args.pids)])
+                    if role == "p0":
+                        target = cmd
+                    else:
+                        target = ssh + [
+                            f"{cfg['ssh_user']}@{cfg['nodes'][role]}",
+                            shlex.join(cmd),
+                        ]
+                    result = subprocess.run(target, input=json.dumps(cfg), text=True)
+                    if result.returncode:
+                        errors.append(f"{role}/{kind}")
+            if errors:
+                break
     if errors:
         raise SystemExit(f"Failed targets: {errors}")
 

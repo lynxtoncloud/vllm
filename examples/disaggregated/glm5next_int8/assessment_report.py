@@ -157,7 +157,7 @@ def fmt(value, digits=2):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("root", type=Path, help="Run directory on P1 after collect")
+    parser.add_argument("root", type=Path, help="Run directory on P0 after collect")
     parser.add_argument("--hours", type=float, default=10)
     parser.add_argument(
         "--input-price", type=float, default=0.8, help="CNY per million input tokens"
@@ -167,7 +167,7 @@ def main():
     )
     parser.add_argument("--electricity-price", type=float, help="Actual CNY per kWh")
     args = parser.parse_args()
-    suite = args.root / "p1/test/data"
+    suite = args.root / "p0/test/data"
     cfg = json.loads((suite / "manifest.json").read_text())["config"]
     samples = {role: read_samples(args.root, role) for role in cfg["nodes"]}
     stages = []
