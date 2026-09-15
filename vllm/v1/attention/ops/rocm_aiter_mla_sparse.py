@@ -603,6 +603,14 @@ def rocm_fp8_paged_mqa_logits(
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
+    if envs.VLLM_ROCM_USE_TRITON_MQA_LOGITS:
+        from vllm.v1.attention.ops.rocm_mqa_logits import paged_mqa_logits
+
+        logger.info_once("Using batched Triton ROCm paged MQA logits")
+        return paged_mqa_logits(
+            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+        )
+
     aiter_paged_mqa_logits_module = None
     # if rocm_aiter_ops.is_enabled():
     batch_size, next_n = q_fp8.shape[:2]
@@ -759,6 +767,12 @@ def rocm_fp8_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     k_fp8, scale = kv
+
+    if envs.VLLM_ROCM_USE_TRITON_MQA_LOGITS:
+        from vllm.v1.attention.ops.rocm_mqa_logits import prefill_mqa_logits
+
+        logger.info_once("Using batched Triton ROCm prefill MQA logits")
+        return prefill_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
         from aiter.ops.flydsl import flydsl_fp8_mqa_logits

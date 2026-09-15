@@ -252,6 +252,8 @@ if TYPE_CHECKING:
     VLLM_GLM5NEXT_TRACE_VISION: bool = False
     VLLM_GLM5NEXT_DUMP_DIR: str | None = None
     VLLM_GLM5NEXT_ISOLATE_GEMM2: bool = False
+    VLLM_ROCM_USE_TRITON_MQA_LOGITS: bool = False
+    VLLM_ROCM_W8A16_CONFIG: str | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1814,6 +1816,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
     ),
     # Eager-only module-boundary diagnostics for GLM-5.3-Flash.
+    # Qualification opt-in; keep the Torch oracle available for A/B comparisons.
+    "VLLM_ROCM_USE_TRITON_MQA_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_ROCM_USE_TRITON_MQA_LOGITS", "0"))
+    ),
+    "VLLM_ROCM_W8A16_CONFIG": lambda: os.getenv("VLLM_ROCM_W8A16_CONFIG"),
     "VLLM_GLM5NEXT_CHECK_FINITE": lambda: bool(
         int(os.getenv("VLLM_GLM5NEXT_CHECK_FINITE", "0"))
     ),

@@ -2,14 +2,58 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ROCm grouped W8A16 GEMM consuming CT offset-binary packed weights."""
 
+import functools
+import json
+from pathlib import Path
+
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.parameter import permute_param_layout_
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+
+
+def validate_launch_config(config):
+    allowed = {
+        "BLOCK_M": (16, 32, 64),
+        "BLOCK_N": (32, 64, 128),
+        "BLOCK_K": (32, 64, 128),
+        "num_warps": (4, 8),
+    }
+    if set(config) != set(allowed) or any(
+        type(config[key]) is not int or config[key] not in values
+        for key, values in allowed.items()
+    ):
+        raise ValueError(f"Invalid W8A16 launch config: {config}")
+    return config
+
+
+@functools.lru_cache
+def load_tuned_configs(path, device_name, arch):
+    data = json.loads(Path(path).read_text())
+    if data.get("device") != device_name or data.get("arch") != arch:
+        raise ValueError("W8A16 tuning file GPU does not match this worker")
+    if data.get("version") != 1:
+        raise ValueError("Unsupported W8A16 tuning file version")
+    return {
+        key: validate_launch_config(value) for key, value in data["configs"].items()
+    }
+
+
+def launch_config(m, n, k, dtype, device):
+    default = dict(BLOCK_M=16, BLOCK_N=32, BLOCK_K=32, num_warps=4)
+    if not envs.VLLM_ROCM_W8A16_CONFIG:
+        return default
+    properties = torch.cuda.get_device_properties(device)
+    configs = load_tuned_configs(
+        envs.VLLM_ROCM_W8A16_CONFIG, properties.name, properties.gcnArchName
+    )
+    # Only use measured shapes; interpolation can regress decode or graph padding.
+    return configs.get(f"{dtype}:{m}:{n}:{k}", default)
 
 
 @triton.jit
@@ -101,7 +145,13 @@ class TritonW8A16LinearKernel(MPLinearKernel):
         x2d = x.reshape(-1, k)
         output = torch.empty((x2d.shape[0], n), dtype=x.dtype, device=x.device)
         if x2d.shape[0]:
-            _w8a16_gemm[(triton.cdiv(x2d.shape[0], 16), triton.cdiv(n, 32))](
+            config = launch_config(x2d.shape[0], n, k, x.dtype, x.device)
+            _w8a16_gemm[
+                (
+                    triton.cdiv(x2d.shape[0], config["BLOCK_M"]),
+                    triton.cdiv(n, config["BLOCK_N"]),
+                )
+            ](
                 x2d,
                 w,
                 scales,
@@ -112,10 +162,7 @@ class TritonW8A16LinearKernel(MPLinearKernel):
                 x2d.stride(0),
                 x2d.stride(1),
                 GROUP_SIZE=128,
-                BLOCK_M=16,
-                BLOCK_N=32,
-                BLOCK_K=32,
-                num_warps=4,
+                **config,
             )
         if bias is not None:
             output.add_(bias)

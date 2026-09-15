@@ -13,6 +13,7 @@ import json
 import runpy
 from pathlib import Path
 from types import SimpleNamespace as NS
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -21,6 +22,207 @@ import torch
 from vllm.scalar_type import scalar_types
 
 DEVICE = "cpu"
+
+
+def test_production_profiles_isolate_configuration_and_preserve_full_context(
+    monkeypatch,
+):
+    suite = _assessment(monkeypatch, "suite")
+    production = importlib.import_module("production_assessment")
+    cfg = json.loads(
+        (Path(suite.__file__).parent / "assessment_config.json").read_text()
+    )
+    cfg["production_cases"] = ["text2k", "text1m"]
+    cfg["environment"]["VLLM_GLM5NEXT_TRACE_VISION"] = "1"
+    result = dict(production.profiles(cfg))
+    assert result["baseline"]["environment"]["VLLM_ROCM_USE_TRITON_MQA_LOGITS"] == "0"
+    assert result["indexer"]["environment"]["ENFORCE_EAGER"] == "1"
+    assert result["graph64"]["environment"]["ENFORCE_EAGER"] == "0"
+    assert result["prefill8192"]["environment"]["MAX_BATCHED_TOKENS"] == "8192"
+    for candidate in result.values():
+        assert candidate["environment"]["MAX_MODEL_LEN"] == "1048576"
+        assert candidate["environment"]["VLLM_GLM5NEXT_TRACE_VISION"] == "0"
+        assert suite.plan(candidate)[-1] == ("perf", "text1m", 32)
+    assert cfg["environment"]["VLLM_GLM5NEXT_TRACE_VISION"] == "1"
+    assert cfg["environment"]["MAX_BATCHED_TOKENS"] == "512"
+
+
+@pytest.mark.parametrize("outcome", ["passed", "skipped", "failure", "empty"])
+def test_production_gpu_gate_rejects_skipped_or_empty_results(
+    monkeypatch, tmp_path, outcome
+):
+    _assessment(monkeypatch, "suite")
+    production = importlib.import_module("production_assessment")
+
+    def execute(cmd, **kwargs):
+        path = Path(
+            next(arg.split("=", 1)[1] for arg in cmd if arg.startswith("--junitxml="))
+        )
+        case = (
+            ""
+            if outcome == "empty"
+            else (
+                "<testcase/>"
+                if outcome == "passed"
+                else f"<testcase><{outcome}/></testcase>"
+            )
+        )
+        path.write_text(f"<testsuites><testsuite>{case}</testsuite></testsuites>")
+
+    monkeypatch.setattr(production.subprocess, "run", execute)
+    if outcome == "passed":
+        production.qualify_kernels({"repo": str(tmp_path)}, tmp_path)
+    else:
+        with pytest.raises(RuntimeError, match="qualification incomplete"):
+            production.qualify_kernels({"repo": str(tmp_path)}, tmp_path)
+
+
+def test_w8a16_tuning_rejects_wrong_device_and_invalid_tiles(tmp_path):
+    import functools
+
+    path = (
+        Path(__file__).parents[2]
+        / "vllm/model_executor/kernels/linear/mixed_precision/triton_w8a16.py"
+    )
+    nodes: list[ast.stmt] = [
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in ("validate_launch_config", "load_tuned_configs", "launch_config")
+    ]
+    env = NS(VLLM_ROCM_W8A16_CONFIG=str(tmp_path / "tune.json"))
+    namespace: dict[str, Any] = dict(
+        functools=functools,
+        json=json,
+        Path=Path,
+        envs=env,
+        torch=NS(
+            cuda=NS(
+                get_device_properties=lambda device: NS(
+                    name="test", gcnArchName="gfx1100"
+                )
+            )
+        ),
+    )
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    tile = dict(BLOCK_M=32, BLOCK_N=64, BLOCK_K=128, num_warps=4)
+    data = dict(
+        version=1, device="test", arch="gfx1100", configs={"bf16:1:128:128": tile}
+    )
+    Path(env.VLLM_ROCM_W8A16_CONFIG).write_text(json.dumps(data))
+    select = namespace["launch_config"]
+    assert select(1, 128, 128, "bf16", 0) == tile
+    assert select(2, 128, 128, "bf16", 0)["BLOCK_M"] == 16
+    with pytest.raises(ValueError, match="GPU does not match"):
+        namespace["load_tuned_configs"](env.VLLM_ROCM_W8A16_CONFIG, "other", "gfx1100")
+    with pytest.raises(ValueError, match="Invalid W8A16"):
+        namespace["validate_launch_config"](tile | {"BLOCK_K": 96})
+
+
+@pytest.mark.parametrize("failure", [None, "start", "request"])
+def test_production_campaign_cleans_active_profile_before_advancing(
+    monkeypatch, tmp_path, failure
+):
+    import asyncio
+
+    suite = _assessment(monkeypatch, "suite")
+    production = importlib.import_module("production_assessment")
+    cfg = json.loads(
+        (Path(suite.__file__).parent / "assessment_config.json").read_text()
+    )
+    cfg.update(
+        log_root=str(tmp_path),
+        production_run_id="test",
+        production_profiles=["baseline", "indexer"],
+    )
+    calls = []
+
+    def control(path, run_id, action, kind, check=True):
+        calls.append((run_id, action, kind))
+        if (
+            failure == "start"
+            and run_id.endswith("indexer")
+            and action == "start"
+            and kind == "engines"
+        ):
+            raise RuntimeError("injected failure")
+        return NS(returncode=0)
+
+    async def ready(*args):
+        pass
+
+    async def run(candidate, data):
+        if failure == "request" and "indexer" in str(data):
+            raise RuntimeError("injected failure")
+        data.mkdir(parents=True)
+        (data / "progress.json").write_text('{"status":"complete"}')
+
+    monkeypatch.setattr(production, "control", control)
+    monkeypatch.setattr(production, "qualify_kernels", lambda *a: None)
+    monkeypatch.setattr(production, "wait_ready", ready)
+    monkeypatch.setattr(production, "run", run)
+    monkeypatch.setattr(
+        production.subprocess, "check_output", lambda *a, **kw: "commit"
+    )
+    if failure:
+        with pytest.raises(RuntimeError, match="injected failure"):
+            asyncio.run(production.campaign(cfg, tmp_path / "campaign"))
+    else:
+        asyncio.run(production.campaign(cfg, tmp_path / "campaign"))
+    for profile in ("test-baseline", "test-indexer"):
+        assert [
+            kind for name, action, kind in calls if name == profile and action == "stop"
+        ] == ["proxy", "engines", "monitors"]
+    assert calls.index(("test-baseline", "stop", "engines")) < calls.index(
+        ("test-indexer", "start", "engines")
+    )
+
+
+@pytest.mark.parametrize("group", [None, 128])
+def test_moe_benchmark_int8_scale_shapes_match_weight_partition(group):
+    path = Path(__file__).parents[2] / "benchmarks/kernels/benchmark_moe.py"
+    fn = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "benchmark_config"
+    )
+    # Exercise the real operand construction, stopping before GPU timing begins.
+    end = next(
+        i
+        for i, node in enumerate(fn.body)
+        if isinstance(node, ast.FunctionDef) and node.name == "prepare"
+    )
+    fn.body = fn.body[:end] + ast.parse("return w1, w2, w1_scale, w2_scale").body
+    namespace = dict(torch=torch, BenchmarkConfig=dict)
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    w1, w2, s1, s2 = namespace["benchmark_config"](
+        {},
+        2,
+        3,
+        512,
+        256,
+        2,
+        torch.bfloat16,
+        False,
+        True,
+        num_iters=1,
+        block_quant_shape=[0, group] if group else None,
+    )
+    for w, s in ((w1, s1), (w2, s2)):
+        assert (
+            s.shape == (*w.shape[:2], w.shape[2] // group)
+            if group
+            else s.shape == w.shape[:2]
+        )
+        assert torch.isfinite(s).all() and (s >= 0).all()
 
 
 def _assessment(monkeypatch, name):
@@ -311,7 +513,7 @@ def test_assessment_functional_gate_and_resume(monkeypatch, tmp_path, answer_ok)
     )
     if answer_ok:
         if fail_perf[0]:
-            with pytest.raises(RuntimeError, match="Performance stage failed"):
+            with pytest.raises(RuntimeError, match="Assessment stage failed"):
                 asyncio.run(suite.run(cfg, tmp_path))
             failed = json.loads((tmp_path / "perf-text2k-c1/result.json").read_text())
             assert not failed["passed"] and failed["failed"] == 4

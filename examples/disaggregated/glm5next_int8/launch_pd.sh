@@ -64,7 +64,21 @@ cmd=(env
 if [[ "$enforce_eager" == 1 ]]; then
   cmd+=(--enforce-eager)
 else
-  cmd+=(--compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":16}')
+  graph_config=$(.venv/bin/python - "${GRAPH_CAPTURE_SIZES:-1,2,4,8,16}" <<'PY'
+import json
+import sys
+
+sizes = [int(value) for value in sys.argv[1].split(",")]
+if not sizes or any(value <= 0 for value in sizes) or len(set(sizes)) != len(sizes):
+    raise ValueError("GRAPH_CAPTURE_SIZES must be unique positive integers")
+print(json.dumps({
+    "cudagraph_mode": "PIECEWISE",
+    "cudagraph_capture_sizes": sorted(sizes),
+    "max_cudagraph_capture_size": max(sizes),
+}))
+PY
+)
+  cmd+=(--compilation-config "$graph_config")
 fi
 if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
   cmd+=(--max-num-seqs "$MAX_NUM_SEQS")

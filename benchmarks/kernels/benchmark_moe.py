@@ -182,10 +182,34 @@ def benchmark_config(
             dtype=dtype,
         )
     elif use_int8_w8a16:
-        w1_scale = torch.randn(
-            (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
-        )
-        w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
+        if block_quant_shape and block_quant_shape[0] == 0:
+            group_size = block_quant_shape[1]
+            w1_scale = (
+                torch.rand(
+                    (num_experts, shard_intermediate_size, hidden_size // group_size),
+                    dtype=dtype,
+                )
+                * 0.001
+            )
+            w2_scale = (
+                torch.rand(
+                    (
+                        num_experts,
+                        hidden_size,
+                        (shard_intermediate_size // 2) // group_size,
+                    ),
+                    dtype=dtype,
+                )
+                * 0.001
+            )
+        else:
+            w1_scale = (
+                torch.rand((num_experts, shard_intermediate_size), dtype=torch.float32)
+                * 0.001
+            )
+            w2_scale = (
+                torch.rand((num_experts, hidden_size), dtype=torch.float32) * 0.001
+            )
     if use_deep_gemm:
         # we use the default block shape for deepgemm
         block_quant_shape = [128, 128]
@@ -910,9 +934,9 @@ def main(args: argparse.Namespace):
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
     block_quant_shape = get_weight_block_size_safety(config)
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_int8_w8a16:
         group_size = get_quantization_group_size(config)
-        if group_size is None:
+        if group_size is None and use_int4_w4a16:
             raise ValueError(
                 "Could not determine group_size from model config. "
                 "The model's quantization_config must contain a 'group_size' "
@@ -921,7 +945,12 @@ def main(args: argparse.Namespace):
             )
         # For int4_w4a16, block_shape = [0, group_size]
         # block_shape[0]=0 means no block quantization on N dimension
-        block_quant_shape = [0, group_size]
+        if group_size is not None and group_size > 0:
+            ensure_divisibility(hidden_size, group_size, "hidden_size")
+            ensure_divisibility(
+                shard_intermediate_size // 2, group_size, "intermediate_size"
+            )
+            block_quant_shape = [0, group_size]
 
     if args.batch_size is None:
         batch_sizes = [
@@ -982,9 +1011,14 @@ def main(args: argparse.Namespace):
         # apply: the gptq_awq kernel handles arbitrary BLOCK_SIZE_K regardless
         # of group_size. Skip block_quant_shape filtering to keep the full
         # search space (e.g. BLOCK_SIZE_K=64 with group_size=128).
-        tune_block_quant_shape = None if use_int4_w4a16 else block_quant_shape
+        grouped_wna16 = (
+            (use_int4_w4a16 or use_int8_w8a16)
+            and block_quant_shape is not None
+            and block_quant_shape[0] == 0
+        )
+        tune_block_quant_shape = None if grouped_wna16 else block_quant_shape
         search_space = get_configs_compute_bound(is_fp16, tune_block_quant_shape)
-        if use_int4_w4a16:
+        if grouped_wna16:
             # SPLIT_K is a required kernel constexpr for gptq_awq kernel;
             # only SPLIT_K=1 is used at runtime, so fix it during tuning.
             for cfg in search_space:

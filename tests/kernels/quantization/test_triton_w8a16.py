@@ -108,3 +108,61 @@ def test_ct_w8a16_tp_loading_and_gemm(monkeypatch, m, dtype, parallel):
         )
     expected = torch.nn.functional.linear(x.float(), weight.float(), bias.float())
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize("m", [1, 17, 32])
+@pytest.mark.parametrize(
+    "block_m,block_n,block_k,warps",
+    [
+        (16, 32, 32, 4),
+        (32, 64, 64, 4),
+        (64, 128, 128, 8),
+    ],
+)
+def test_w8a16_graph_replay_consumes_new_activations(
+    m, block_m, block_n, block_k, warps
+):
+    from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
+        _w8a16_gemm,
+    )
+    from vllm.triton_utils import triton
+
+    torch.manual_seed(23)
+    n, k = 70, 256
+    quant = torch.randint(-128, 128, (n, k), device="cuda", dtype=torch.int32)
+    packed = torch.zeros(n, k // 4, device="cuda", dtype=torch.int32)
+    for shift in range(4):
+        packed |= (quant[:, shift::4] + 128) << (8 * shift)
+    scales = (torch.rand(n, k // 128, device="cuda") * 0.001).bfloat16()
+    weight = (quant.float() * scales.float().repeat_interleave(128, 1)).bfloat16()
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(m, n, device="cuda", dtype=x.dtype)
+
+    def call():
+        _w8a16_gemm[(triton.cdiv(m, block_m), triton.cdiv(n, block_n))](
+            x,
+            packed,
+            scales,
+            out,
+            m,
+            n,
+            k,
+            *x.stride(),
+            GROUP_SIZE=128,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            num_warps=warps,
+        )
+
+    call()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), x.float() @ weight.float().T, atol=0.02, rtol=0.02
+        )

@@ -186,12 +186,13 @@ async def run(cfg, out):
     if manifest.exists() and json.loads(manifest.read_text()) != metadata:
         raise ValueError("Config/code changed. Start a new run ID, do not mix results.")
     save(manifest, metadata)
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError(
-            "Install ffmpeg (including libx264) before starting the suite"
-        )
-    # Verify codec before starting any long request.
-    make_media(out / "fixtures")
+    if any(case not in LENGTHS for _, case, _ in matrix):
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError(
+                "Install ffmpeg (including libx264) before starting the suite"
+            )
+        # Text-only performance qualification does not need a video codec.
+        make_media(out / "fixtures")
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"], local_files_only=True)
     urls = (
         f"http://{cfg['nodes']['p0']}:8000",
@@ -399,9 +400,9 @@ async def run(cfg, out):
             save(result_file, stage)
             if not stage["passed"]:
                 failures.append(key)
-                if mode == "perf":
+                if mode == "perf" or cfg.get("fail_fast_functional", False):
                     raise RuntimeError(
-                        f"Performance stage failed: {key}; resume after recovery"
+                        f"Assessment stage failed: {key}; resume after recovery"
                     )
             await health(client, urls)
         save(

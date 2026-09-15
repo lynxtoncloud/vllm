@@ -18,6 +18,8 @@ import regex as re
 
 HERE = Path(__file__).resolve().parent
 KINDS = {
+    "production": ("production", ("p0",)),
+    "communication": ("collective", ("p0", "p1", "d0", "d1")),
     "engines": ("engine", ("p0", "p1", "d0", "d1")),
     "monitors": ("monitor", ("p0", "p1", "d0", "d1")),
     "proxy": ("proxy", ("p0",)),
@@ -67,6 +69,9 @@ def command(cfg, role, kind, directory):
         "VLLM_GLM5NEXT_TRACE_VISION",
         "VLLM_GLM5NEXT_DUMP_DIR",
         "VLLM_GLM5NEXT_ISOLATE_GEMM2",
+        "VLLM_ROCM_USE_TRITON_MQA_LOGITS",
+        "VLLM_ROCM_W8A16_CONFIG",
+        "GRAPH_CAPTURE_SIZES",
         "MAX_NUM_SEQS",
     ):
         env.pop(name, None)
@@ -79,6 +84,26 @@ def command(cfg, role, kind, directory):
     env.update({f"{node.upper()}_IP": ip for node, ip in cfg["nodes"].items()})
     if kind == "engine":
         return ["bash", str(script / "launch_pd.sh"), role], env
+    if kind == "collective":
+        leader = "p0" if role.startswith("p") else "d0"
+        env.update(
+            HIP_VISIBLE_DEVICES="0,1,2,3,4,5,6,7",
+            NCCL_SOCKET_IFNAME=cfg["interface"],
+            GLOO_SOCKET_IFNAME=cfg["interface"],
+        )
+        return [
+            python,
+            "-m",
+            "torch.distributed.run",
+            "--nnodes=2",
+            "--nproc-per-node=8",
+            f"--node-rank={int(role.endswith('1'))}",
+            f"--master-addr={cfg['nodes'][leader]}",
+            f"--master-port={29601 if leader == 'p0' else 29602}",
+            str(repo / "benchmarks/kernels/benchmark_rocm_collectives.py"),
+            "--output",
+            str(directory / "data/collectives.json"),
+        ], env
     if kind == "proxy":
         return [
             python,
@@ -96,7 +121,11 @@ def command(cfg, role, kind, directory):
             "--decoder-ports",
             "8002",
         ], env
-    name = "assessment_monitor.py" if kind == "monitor" else "assessment_suite.py"
+    name = {
+        "monitor": "assessment_monitor.py",
+        "test": "assessment_suite.py",
+        "production": "production_assessment.py",
+    }[kind]
     return [
         python,
         str(script / name),
@@ -217,7 +246,7 @@ def local(cfg, args):
             raise RuntimeError(f"Code differs from P0: {current_commit}")
         if config_path.exists() and json.loads(config_path.read_text()) != cfg:
             raise ValueError("Configuration changed; use a new run ID")
-        if args.kind == "engine":
+        if args.kind in ("engine", "collective"):
             from assessment_gpu import run
 
             if not run(cfg, args.role, "gpu-check", [], root / "gpu-checks"):
@@ -273,7 +302,9 @@ def main():
             "gpu-clean",
         ),
     )
-    parser.add_argument("kind", choices=(*KINDS, "all", "engine", "monitor"))
+    parser.add_argument(
+        "kind", choices=(*KINDS, "all", "engine", "monitor", "collective")
+    )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--config", type=Path, default=HERE / "assessment_config.json")
     parser.add_argument("--local", action="store_true")
@@ -298,7 +329,14 @@ def main():
             f"Run this command on {expected_role}: {cfg['nodes'][expected_role]}"
         )
     if args.local:
-        if not args.role or args.kind not in ("engine", "monitor", "proxy", "test"):
+        if not args.role or args.kind not in (
+            "engine",
+            "monitor",
+            "proxy",
+            "test",
+            "production",
+            "collective",
+        ):
             parser.error("Local command needs --role and a singular job kind")
         local(cfg, args)
         return
@@ -306,13 +344,15 @@ def main():
         parser.error("Use gpu-check/gpu-clean engines")
     if args.pids and (args.action != "gpu-clean" or not args.only_role):
         parser.error("Explicit PIDs require gpu-clean engines --only-role NODE")
-    if args.action == "worker" or args.kind in ("engine", "monitor"):
+    if args.action == "worker" or args.kind in ("engine", "monitor", "collective"):
         parser.error("Use engines/monitors for cluster operations")
     if args.action == "start" and args.kind == "all":
         parser.error("Start monitors, engines, proxy and test explicitly in that order")
     cfg["expected_commit"] = subprocess.check_output(
         ["git", "-C", cfg["repo"], "rev-parse", "HEAD"], text=True
     ).strip()
+    if args.kind == "production":
+        cfg["production_run_id"] = args.run_id
     ssh = [
         "ssh",
         "-p",
@@ -332,7 +372,9 @@ def main():
         f"{cfg['repo']}/examples/disaggregated/glm5next_int8/assessment_jobs.py"
     )
     groups = (
-        ("test", "proxy", "engines", "monitors") if args.kind == "all" else (args.kind,)
+        ("production", "communication", "test", "proxy", "engines", "monitors")
+        if args.kind == "all"
+        else (args.kind,)
     )
     errors = []
     if args.action == "collect":
@@ -357,7 +399,7 @@ def main():
     else:
         phases = (
             ("gpu-check", "start")
-            if args.action == "start" and args.kind == "engines"
+            if args.action == "start" and args.kind in ("engines", "communication")
             else (args.action,)
         )
         for phase in phases:
@@ -393,6 +435,20 @@ def main():
                         errors.append(f"{role}/{kind}")
             if errors:
                 break
+    if args.action == "stop" and "production" in groups:
+        active = Path(cfg["log_root"]) / args.run_id / "p0/production/data/active.json"
+        if active.exists():
+            from production_assessment import control
+
+            entry = json.loads(active.read_text())
+            # Run outside the stopped supervisor's process group. Cleanup may
+            # exceed its TERM grace period when a remote engine is hung.
+            for kind in ("proxy", "engines", "monitors"):
+                result = control(
+                    entry["config"], entry["run_id"], "stop", kind, check=False
+                )
+                if result.returncode:
+                    errors.append(f"production/{kind}")
     if errors:
         raise SystemExit(f"Failed targets: {errors}")
 

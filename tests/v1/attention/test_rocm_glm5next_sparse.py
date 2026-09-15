@@ -20,6 +20,91 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 )
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
+@pytest.mark.parametrize("heads,dim", [(1, 64), (16, 128), (64, 128)])
+def test_batched_prefill_logits_preserve_mask_and_replay(heads, dim):
+    """Graph replay must consume new queries and GPU-only ragged boundaries."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import fp8_mqa_logits_torch
+    from vllm.v1.attention.ops.rocm_mqa_logits import prefill_mqa_logits
+
+    torch.manual_seed(21)
+    fp8 = current_platform.fp8_dtype()
+    q = torch.randn(3, heads, dim, device="cuda").to(fp8)
+    k = torch.randn(137, dim, device="cuda").to(fp8)
+    scale = torch.rand(137, 1, device="cuda") * 0.01
+    weights = torch.rand(3, heads, device="cuda")
+    starts = torch.tensor([0, 7, 129], device="cuda", dtype=torch.int32)
+    ends = torch.tensor([0, 133, 137], device="cuda", dtype=torch.int32)
+    for _ in range(2):
+        prefill_mqa_logits(q, (k, scale), weights, starts, ends)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = prefill_mqa_logits(q, (k, scale), weights, starts, ends)
+    for step in range(3):
+        q.copy_(torch.randn(q.shape, device="cuda").to(fp8))
+        ends[0] = step * 31
+        graph.replay()
+        expected = fp8_mqa_logits_torch(q, (k, scale), weights, starts, ends)
+        torch.testing.assert_close(output, expected, atol=0.005, rtol=0.005)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
+@pytest.mark.parametrize("page", [1, 16, 64])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("two_dimensional_lengths", [False, True])
+@pytest.mark.parametrize("padded_pages", [False, True])
+def test_batched_paged_logits_replay_reads_updated_pages_and_lengths(
+    page, next_n, two_dimensional_lengths, padded_pages
+):
+    """Check AMD tile layout, scale offsets, partial pages and speculative rows."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import fp8_paged_mqa_logits_torch
+    from vllm.v1.attention.ops.rocm_mqa_logits import paged_mqa_logits
+
+    torch.manual_seed(22)
+    fp8 = current_platform.fp8_dtype()
+    batch, heads, dim, pages = 2, 16, 128, 5
+    q = torch.randn(batch, next_n, heads, dim, device="cuda").to(fp8)
+    values = torch.randn(pages, page, dim, device="cuda").to(fp8)
+    if page > 1:
+        values = values.reshape(pages, page // 16, 16, dim // 16, 16)
+        values = values.transpose(2, 3).contiguous()
+    scales = torch.rand(pages, page, device="cuda") * 0.01
+    packed = torch.cat(
+        (values.reshape(pages, -1).view(torch.uint8), scales.view(torch.uint8)), dim=1
+    ).reshape(pages, page, 1, dim + 4)
+    if padded_pages:
+        storage = torch.empty(
+            pages, page * (dim + 4) + 16, dtype=torch.uint8, device="cuda"
+        )
+        view = storage[:, : page * (dim + 4)].view_as(packed)
+        view.copy_(packed)
+        packed = view
+    weights = torch.rand(batch * next_n, heads, device="cuda")
+    table = torch.tensor([[3, 1, 4], [4, 2, 0]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([page * 3 - 1, 0], device="cuda", dtype=torch.int32)
+    if two_dimensional_lengths:
+        lengths = (
+            (lengths[:, None] - next_n + 1 + torch.arange(next_n, device="cuda"))
+            .clamp_min(0)
+            .int()
+        )
+    limit = page * 3 + 11  # Output bound can exceed the current block table width.
+    for _ in range(2):
+        paged_mqa_logits(q, packed, weights, lengths, table, limit)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = paged_mqa_logits(q, packed, weights, lengths, table, limit)
+    for step in range(3):
+        table.copy_(table.flip(1))
+        q.copy_(torch.randn(q.shape, device="cuda").to(fp8))
+        lengths[1] = min(page * 3, next_n + step)
+        graph.replay()
+        expected = fp8_paged_mqa_logits_torch(q, packed, weights, lengths, table, limit)
+        torch.testing.assert_close(output, expected, atol=0.001, rtol=0.001)
+
+
 @triton.jit
 def _store_sparse_kv_row_offset_kernel(slot_ptr, output_ptr, stride: tl.constexpr):
     slot = tl.load(slot_ptr)
