@@ -440,12 +440,14 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("logical_block_size", [1152, 640])
+@pytest.mark.parametrize(
+    "logical_block_size,transfer_block_size", [(1152, 64), (640, 64), (384, 384)]
+)
 @pytest.mark.parametrize("tail_first", [False, True])
 def test_register_compressed_indexer_uses_virtual_transfer_pages(
-    logical_block_size, tail_first
+    logical_block_size, transfer_block_size, tail_first
 ):
-    """Compressed indexer rows must split into contiguous NIXL transfer pages."""
+    """Transfer pages can split or join compressed kernel rows without reordering."""
     from unittest.mock import MagicMock
 
     from vllm.config import set_current_vllm_config
@@ -467,7 +469,6 @@ def test_register_compressed_indexer_uses_virtual_transfer_pages(
     )
 
     num_logical_blocks = 3
-    transfer_block_size = 64
     kernel_block_size = 128
     tokens_per_state = 4
     state_content_bytes = 132

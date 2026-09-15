@@ -24,6 +24,78 @@ from vllm.scalar_type import scalar_types
 DEVICE = "cpu"
 
 
+@pytest.mark.parametrize("transfer_tokens", [64, 128, 384])
+def test_nixl_compressed_transfer_preserves_nonconsecutive_block_contents(
+    transfer_tokens,
+):
+    """Run the registration branch on real byte views without importing NIXL.
+
+    One 384-token manager block has three 128-token kernel pages. Copying a
+    selected block must join those adjacent pages, not copy from three slabs.
+    """
+    path = (
+        Path(__file__).parents[2]
+        / "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py"
+    )
+    tree = ast.parse(path.read_text())
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_uses_dense_virtual_transfer_pages"
+    )
+    registration = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "register_kv_caches"
+    )
+    # The generic attention branch immediately follows the tail-region branch.
+    branch = next(
+        node.orelse
+        for node in ast.walk(registration)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "isinstance(layer_spec, KpoolTailSpec)"
+        and len(node.body) == 1
+        and isinstance(node.body[0], ast.Assign)
+    )
+
+    class MLASpec:
+        tokens_per_state = 4
+        state_content_size_bytes = 132
+
+    page_bytes = transfer_tokens // 4 * 132
+    raw = (torch.arange(8 * 384 // 4 * 132) % 251).to(torch.uint8)
+    cache = raw.reshape(8 * 3, 1, 32, 132)
+    ns = {
+        "torch": torch,
+        "KVCacheSpec": object,
+        "MLAAttentionSpec": MLASpec,
+        "cache": cache,
+        "layer_spec": MLASpec(),
+        "num_blocks": raw.numel() // page_bytes,
+        "physical_page_size": page_bytes,
+        "registration_base": raw.data_ptr(),
+        "registration_len": raw.nbytes,
+        "packed_storage": False,
+        "is_mla_region": True,
+        "self": NS(_is_csa_linear=False),
+        "layer_name": "indexer",
+    }
+    exec(
+        compile(ast.Module(body=[helper, *branch], type_ignores=[]), str(path), "exec"),
+        ns,
+    )
+    actual = torch.full_like(raw, 255)
+    for base, length, stride in ns["region_specs"]:
+        offset = base - raw.data_ptr()
+        actual[offset + 2 * stride : offset + 2 * stride + length] = raw[
+            offset + 5 * stride : offset + 5 * stride + length
+        ]
+    expected = torch.full_like(raw, 255)
+    expected[2 * page_bytes : 3 * page_bytes] = raw[5 * page_bytes : 6 * page_bytes]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_production_profiles_isolate_configuration_and_preserve_full_context(
     monkeypatch,
 ):

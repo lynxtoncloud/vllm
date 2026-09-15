@@ -134,7 +134,7 @@ def _uses_dense_virtual_transfer_pages(
     physical_page_size: int,
     num_blocks: int,
 ) -> bool:
-    """Return whether a compressed kernel view can be split into NIXL pages."""
+    """Return whether dense kernel rows can be split/joined into NIXL pages."""
     if not (
         isinstance(layer_spec, MLAAttentionSpec)
         and layer_spec.tokens_per_state > 1
@@ -148,10 +148,12 @@ def _uses_dense_virtual_transfer_pages(
 
     block_stride = cache.stride(0) * cache.element_size()
     return (
-        block_stride > physical_page_size
-        and block_stride % physical_page_size == 0
+        block_stride > 0
+        and max(block_stride, physical_page_size)
+        % min(block_stride, physical_page_size)
+        == 0
         and physical_page_size % layer_spec.state_content_size_bytes == 0
-        and cache.shape[0] * (block_stride // physical_page_size) == num_blocks
+        and cache.shape[0] * block_stride == num_blocks * physical_page_size
         and cache.nbytes == num_blocks * physical_page_size
     )
 
@@ -1458,7 +1460,9 @@ class NixlBaseConnectorWorker:
                     layer_spec, cache, physical_page_size, num_blocks
                 )
                 if virtual_transfer_pages:
-                    # A compressed kernel row can contain multiple NIXL transfer pages.
+                    # Transfer pages may split a kernel row or join adjacent rows.
+                    # In either case block IDs address the dense byte stream;
+                    # treating joined rows as separate slabs reorders the blocks.
                     region_specs = [
                         (cache.data_ptr(), physical_page_size, physical_page_size)
                     ]
