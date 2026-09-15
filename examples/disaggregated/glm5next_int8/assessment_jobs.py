@@ -64,6 +64,7 @@ def command(cfg, role, kind, directory):
         "PYTHONPATH",
         "VLLM_ROCM_GFX1100_GLM53",
         "VLLM_GLM5NEXT_CHECK_FINITE",
+        "VLLM_GLM5NEXT_TRACE_VISION",
         "VLLM_GLM5NEXT_DUMP_DIR",
         "VLLM_GLM5NEXT_ISOLATE_GEMM2",
         "MAX_NUM_SEQS",

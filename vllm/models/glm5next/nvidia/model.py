@@ -1157,6 +1157,20 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
+        if envs.VLLM_GLM5NEXT_TRACE_VISION:
+            from vllm.models.glm5next.diagnostics import install_module_trace
+
+            install_module_trace(
+                self.visual,
+                rank=get_tensor_model_parallel_rank(),
+                enforce_eager=(
+                    vllm_config.model_config.enforce_eager
+                    and not vllm_config.compilation_config.compile_mm_encoder
+                    and not vllm_config.compilation_config.cudagraph_mm_encoder
+                ),
+                synchronize=torch.accelerator.synchronize,
+            )
+
         # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
         # so pipeline parallelism is gated off (consistent with the text-only
         # model) and we intentionally do not alias it here.

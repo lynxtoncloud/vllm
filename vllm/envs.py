@@ -249,6 +249,7 @@ if TYPE_CHECKING:
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
     VLLM_GLM5NEXT_CHECK_FINITE: bool = False
+    VLLM_GLM5NEXT_TRACE_VISION: bool = False
     VLLM_GLM5NEXT_DUMP_DIR: str | None = None
     VLLM_GLM5NEXT_ISOLATE_GEMM2: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
@@ -1815,6 +1816,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Eager-only module-boundary diagnostics for GLM-5.3-Flash.
     "VLLM_GLM5NEXT_CHECK_FINITE": lambda: bool(
         int(os.getenv("VLLM_GLM5NEXT_CHECK_FINITE", "0"))
+    ),
+    # Synchronize and trace GLM vision modules to locate stalled eager execution.
+    "VLLM_GLM5NEXT_TRACE_VISION": lambda: bool(
+        int(os.getenv("VLLM_GLM5NEXT_TRACE_VISION", "0"))
     ),
     # Save failing W8A16 GEMM2 operands when GLM eager finite checks are enabled.
     "VLLM_GLM5NEXT_DUMP_DIR": lambda: os.getenv("VLLM_GLM5NEXT_DUMP_DIR"),

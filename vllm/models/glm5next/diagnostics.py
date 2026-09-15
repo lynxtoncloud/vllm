@@ -2,12 +2,68 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in eager diagnostics for the first non-finite GLM activation."""
 
+import faulthandler
+import os
+import time
 from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
 import torch
 from torch import nn
+
+
+def install_module_trace(
+    model: nn.Module,
+    *,
+    rank: int,
+    enforce_eager: bool,
+    synchronize: Callable[[], None],
+) -> None:
+    """Trace vision module progress with GPU fences; diagnostic use only.
+
+    BEGIN precedes the input fence, CALL follows it, and DONE follows the
+    output fence. A missing DONE identifies a module whose call or GPU work
+    did not finish. The periodic Python stack dump helps distinguish those
+    cases. Fences change scheduling, so this is not a performance measurement.
+    """
+    if not enforce_eager:
+        raise ValueError("VLLM_GLM5NEXT_TRACE_VISION requires eager vision execution")
+
+    def emit(name, event, detail=""):
+        print(
+            f"GLM vision trace: rank={rank} pid={os.getpid()} "
+            f"time={time.time():.6f} module={name} {event} {detail}",
+            flush=True,
+        )
+
+    def begin(module, args):
+        faulthandler.dump_traceback_later(60, repeat=True)
+
+    def finish(module, args, output):
+        faulthandler.cancel_dump_traceback_later()
+
+    model.register_forward_pre_hook(begin)
+
+    def attach(module, name):
+        def before(module, args, kwargs):
+            shapes = [tuple(x.shape) for x in args if isinstance(x, torch.Tensor)]
+            emit(name, "BEGIN", f"shapes={shapes}")
+            synchronize()
+            emit(name, "CALL")
+
+        def after(module, args, output):
+            emit(name, "RETURN")
+            synchronize()
+            emit(name, "DONE")
+
+        module.register_forward_pre_hook(before, with_kwargs=True)
+        module.register_forward_hook(after)
+
+    for name, module in model.named_modules():
+        if not isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+            attach(module, name or "visual")
+    model.register_forward_hook(finish, always_call=True)
 
 
 def install_finite_checks(

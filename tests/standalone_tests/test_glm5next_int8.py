@@ -398,6 +398,48 @@ def _finite_checks():
     return runpy.run_path(str(path))["install_finite_checks"]
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_vision_trace_reports_progress_and_cancels_stack_timer(
+    monkeypatch, capsys, fail
+):
+    import faulthandler
+
+    timer, cancel, fence = Mock(), Mock(), Mock()
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", timer)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", cancel)
+    path = Path(__file__).parents[2] / "vllm/models/glm5next/diagnostics.py"
+    install = runpy.run_path(str(path))["install_module_trace"]
+
+    class Compute(torch.nn.Module):
+        def forward(self, x):
+            if fail:
+                raise RuntimeError("test stalled operator")
+            return x + 1
+
+    model = torch.nn.Sequential(Compute())
+    install(model, rank=8, enforce_eager=True, synchronize=fence)
+    if fail:
+        with pytest.raises(RuntimeError, match="test stalled operator"):
+            model(torch.ones(2))
+    else:
+        torch.testing.assert_close(model(torch.ones(2)), torch.full((2,), 2.0))
+    timer.assert_called_once_with(60, repeat=True)
+    cancel.assert_called_once_with()
+    log = capsys.readouterr().out
+    assert "rank=8" in log and "module=0 CALL" in log
+    assert ("module=0 DONE" in log) is not fail
+    assert fence.call_count == (2 if fail else 4)
+
+
+def test_vision_trace_rejects_graph_before_registering_hooks():
+    path = Path(__file__).parents[2] / "vllm/models/glm5next/diagnostics.py"
+    install = runpy.run_path(str(path))["install_module_trace"]
+    model = torch.nn.Identity()
+    with pytest.raises(ValueError, match="requires eager"):
+        install(model, rank=0, enforce_eager=False, synchronize=Mock())
+    assert not model._forward_hooks and not model._forward_pre_hooks
+
+
 def test_gemm2_shared_replay_preserves_values_strides_and_disjoint_output():
     call = _gemm2_call()
     call["A"] = torch.arange(16, dtype=torch.bfloat16).view(2, 8)[:, :4]
