@@ -186,7 +186,12 @@ async def request(client, base_url, endpoint, payload, timeout):
 
     async def consume():
         nonlocal first, last, text, usage, finished, done
-        async with client.stream("POST", base_url + endpoint, json=payload) as resp:
+        async with client.stream(
+            "POST",
+            base_url + endpoint,
+            json=payload,
+            timeout=httpx.Timeout(timeout, connect=30),
+        ) as resp:
             if resp.is_error:
                 body = (await resp.aread()).decode(errors="replace")
                 raise RuntimeError(f"HTTP {resp.status_code}: {body[:2000]}")

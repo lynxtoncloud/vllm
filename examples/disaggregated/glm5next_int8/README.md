@@ -509,3 +509,9 @@ The remaining deployment acceptance items are:
 - Performance starts after functional acceptance, measuring all 32 GPUs and
   the selected transport. Local CPU tests and registration probes do not prove
   production readiness.
+
+## Background full assessment
+
+See [the P1-managed full assessment guide](ASSESSMENT.md) for detached shell-session
+jobs, per-stage resume, 1M and multimodal tests, four-host monitoring and reports.
+It does not use systemd or create server worktrees.

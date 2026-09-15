@@ -8,6 +8,8 @@ and streaming-loader functions in isolation; full model tests run separately.
 
 import ast
 import builtins
+import importlib
+import json
 import runpy
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -19,6 +21,199 @@ import torch
 from vllm.scalar_type import scalar_types
 
 DEVICE = "cpu"
+
+
+def _assessment(monkeypatch, name):
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).parents[2] / "examples/disaggregated/glm5next_int8")
+    )
+    return importlib.import_module("assessment_" + name)
+
+
+def test_assessment_stop_rejects_reused_pid_and_previous_boot(monkeypatch):
+    jobs = _assessment(monkeypatch, "jobs")
+    state = dict(pid=42, start_ticks="100", boot_id="boot-a", session=42, state="S")
+    monkeypatch.setattr(jobs, "identity", lambda pid: state.copy())
+    assert jobs.owned(state)
+    assert not jobs.owned(state | {"start_ticks": "99"})
+    assert not jobs.owned(state | {"boot_id": "boot-b"})
+    monkeypatch.setattr(jobs, "identity", lambda pid: state | {"session": 41})
+    assert not jobs.owned(state)
+
+
+def test_assessment_energy_uses_host_power_and_does_not_double_count_gpu(monkeypatch):
+    report = _assessment(monkeypatch, "report")
+    samples = [
+        {
+            "time": t,
+            "gpu": {"card0": {"sensors": {"power1_average": 100000000}}},
+            "host_power": {"stdout": "Instantaneous power reading: 1000 Watts"},
+            "network": {"bond0": {"counters": {"tx_bytes": int(t * 1e9)}}},
+        }
+        for t in (0, 10, 20)
+    ]
+    result = report.window(samples, 5, 15, "bond0")
+    assert result["coverage"] == 1
+    assert result["host_energy_kwh"] == pytest.approx(1000 * 10 / 3.6e6)
+    assert result["gpu_energy_kwh"] == pytest.approx(100 * 10 / 3.6e6)
+    assert result["nic_tx_mean_gbps"] == 8
+    assert report.window([], 5, 15, "bond0")["host_energy_kwh"] is None
+    assert report.counter_rate(100, 10, 10) is None
+
+
+def test_assessment_report_reconciles_four_host_energy_and_revenue(
+    monkeypatch, tmp_path
+):
+    import sys
+
+    report = _assessment(monkeypatch, "report")
+    folder = Path(report.__file__).parent
+    cfg = json.loads((folder / "assessment_config.json").read_text())
+    cfg.update(cases=["text2k"], concurrency=[1])
+    data = tmp_path / "p1/test/data"
+    data.mkdir(parents=True)
+    (data / "manifest.json").write_text(json.dumps({"config": cfg}))
+    stage = dict(
+        mode="perf",
+        case="text2k",
+        concurrency=1,
+        passed=True,
+        started=0,
+        ended=10,
+        duration_s=10,
+        completed=16,
+        failed=0,
+        input_tokens_per_s=100,
+        output_tokens_per_s=10,
+        ttft_s=dict(mean=1, p95=2),
+        tpot_s=dict(mean=0.1, p95=0.2),
+    )
+    (data / "perf-text2k-c1").mkdir()
+    (data / "perf-text2k-c1/result.json").write_text(json.dumps(stage))
+    for role in cfg["nodes"]:
+        path = tmp_path / role / "monitor/data"
+        path.mkdir(parents=True)
+        (path / "samples.jsonl").write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "time": t,
+                        "host_power": {
+                            "stdout": "Instantaneous power reading: 1000 Watts"
+                        },
+                    }
+                )
+                for t in (0, 10)
+            )
+        )
+    monkeypatch.setattr(
+        sys, "argv", ["report", str(tmp_path), "--electricity-price", "0.8"]
+    )
+    report.main()
+    result = json.loads((tmp_path / "report.json").read_text())["stages"][0]
+    assert result["daily_gross_cny"] == pytest.approx(3.888)
+    assert result["daily_electricity_cny"] == pytest.approx(32)
+    assert "未完成/未执行" in (tmp_path / "report.md").read_text()
+
+
+@pytest.mark.parametrize("answer_ok", [True, False, "perf_failure"])
+def test_assessment_functional_gate_and_resume(monkeypatch, tmp_path, answer_ok):
+    """Exercise real HTTP/SSE parsing and persistence without GPUs or a tokenizer."""
+    import asyncio
+    import sys
+
+    import httpx
+
+    suite = _assessment(monkeypatch, "suite")
+    cfg = json.loads(
+        (Path(suite.__file__).parent / "assessment_config.json").read_text()
+    )
+    cfg.update(
+        repo=str(Path(__file__).parents[2]),
+        cases=["text2k"],
+        concurrency=[1],
+        minimum_requests=2,
+        functional_repeats=2,
+        warmups=0,
+    )
+    tokenizer = NS(from_pretrained=lambda *a, **kw: None)
+    monkeypatch.setitem(sys.modules, "transformers", NS(AutoTokenizer=tokenizer))
+    monkeypatch.setattr(suite.shutil, "which", lambda _: "/mock/ffmpeg")
+    monkeypatch.setattr(suite, "make_media", lambda *a: {})
+    monkeypatch.setattr(
+        suite,
+        "prepare",
+        lambda *a: ("/v1/completions", {"model": "test"}, {"answer": "ok"}),
+    )
+    metrics_calls = [0]
+
+    async def snapshot(client, url, path):
+        metrics_calls[0] += 1
+        return dict(
+            zip(
+                suite.transfer_ok.__globals__["METRICS"],
+                [metrics_calls[0], metrics_calls[0], 0, 0],
+            )
+        )
+
+    monkeypatch.setattr(suite, "snapshot", snapshot)
+    sleep = asyncio.sleep
+
+    async def fast_sleep(seconds):
+        await sleep(0 if seconds == 2 else seconds)
+
+    monkeypatch.setattr(suite.asyncio, "sleep", fast_sleep)
+    calls = []
+    fail_perf = [answer_ok == "perf_failure"]
+
+    def respond(req):
+        calls.append(req.url.path)
+        if req.url.path == "/tokenize":
+            return httpx.Response(200, json={"max_model_len": 1048576})
+        if req.url.path == "/v1/completions":
+            if fail_perf[0] and calls.count("/v1/completions") > 2:
+                return httpx.Response(500, text="injected engine failure")
+            # Long prefill must not inherit the 30-second metrics/health timeout.
+            assert req.extensions["timeout"]["read"] == cfg["request_timeout"]
+            event = {
+                "choices": [
+                    {
+                        "text": '{"answer":"' + ("ok" if answer_ok else "bad") + '"}',
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 2047, "completion_tokens": 256},
+            }
+            return httpx.Response(
+                200, text="data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
+            )
+        return httpx.Response(200, json={})
+
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(
+        suite.httpx,
+        "AsyncClient",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    if answer_ok:
+        if fail_perf[0]:
+            with pytest.raises(RuntimeError, match="Performance stage failed"):
+                asyncio.run(suite.run(cfg, tmp_path))
+            failed = json.loads((tmp_path / "perf-text2k-c1/result.json").read_text())
+            assert not failed["passed"] and failed["failed"] == 4
+            fail_perf[0] = False
+        asyncio.run(suite.run(cfg, tmp_path))
+        result = json.loads((tmp_path / "perf-text2k-c1/result.json").read_text())
+        assert result["passed"] and result["completed"] == 4
+        before = calls.count("/v1/completions")
+        asyncio.run(suite.run(cfg, tmp_path))
+        assert calls.count("/v1/completions") == before
+    else:
+        with pytest.raises(RuntimeError, match="Failed/blocked"):
+            asyncio.run(suite.run(cfg, tmp_path))
+        result = json.loads((tmp_path / "perf-text2k-c1/result.json").read_text())
+        assert result["status"] == "blocked_functional"
+        assert calls.count("/v1/completions") == 2
 
 
 def _wna16_debug():

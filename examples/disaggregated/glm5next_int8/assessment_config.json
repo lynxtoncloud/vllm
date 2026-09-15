@@ -1,0 +1,29 @@
+{
+  "repo": "/data/vllm",
+  "log_root": "/data/logs/glm53-assessment",
+  "ssh_port": 21985,
+  "ssh_key": "~/.ssh/rebond.pem",
+  "ssh_user": "root",
+  "nodes": {"p0": "10.5.10.36", "p1": "10.5.10.3", "d0": "10.5.10.55", "d1": "10.5.10.56"},
+  "model": "/data/models/zai-org/GLM-5.3-Flash-W8A16-G128",
+  "model_name": "glm53-int8",
+  "interface": "bond0",
+  "monitor_interval": 10,
+  "concurrency": [1, 2, 4, 8, 16, 32],
+  "minimum_requests": 16,
+  "functional_repeats": 3,
+  "output_tokens": 256,
+  "request_timeout": 86400,
+  "warmups": 2,
+  "environment": {
+    "MAX_MODEL_LEN": "1048576",
+    "MAX_BATCHED_TOKENS": "512",
+    "GPU_MEMORY_UTILIZATION": "0.90",
+    "ENFORCE_EAGER": "1",
+    "UCX_ROCM_COPY_DMABUF": "y",
+    "UCX_IB_GDA_DMABUF_ENABLE": "y",
+    "LD_LIBRARY_PATH": "/data/opt/ucx/lib:/opt/rocm/lib:/opt/rocm/lib64",
+    "AMDGCN_USE_BUFFER_OPS": "1",
+    "VLLM_GLM5NEXT_CHECK_FINITE": "0"
+  }
+}
