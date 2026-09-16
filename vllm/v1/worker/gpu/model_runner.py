@@ -205,6 +205,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
         self.device = device
+        self.input_trace = None
+        if envs.VLLM_TRACE_MODEL_INPUTS:
+            from vllm.v1.worker.gpu.input_trace import InputPreparationTrace
+
+            self.input_trace = InputPreparationTrace(
+                rank=self.parallel_config.rank,
+                enforce_eager=self.model_config.enforce_eager,
+                synchronize=functools.partial(
+                    torch.accelerator.synchronize, device.index
+                ),
+            )
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -1623,14 +1634,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        trace = (
+            self.input_trace
+            if self.input_trace is not None
+            and self.input_trace.ready
+            and not dummy_run
+            and not is_profile
+            and scheduler_output.total_num_scheduled_tokens > 0
+            else None
+        )
+        if trace is not None:
+            trace.begin(scheduler_output.num_scheduled_tokens)
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
+            if trace is not None:
+                trace.checkpoint("add_requests")
             self.update_requests(scheduler_output)
+            if trace is not None:
+                trace.checkpoint("update_requests")
             self.block_tables.apply_staged_writes()
+            if trace is not None:
+                trace.checkpoint("block_table_writes")
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1699,7 +1727,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
             )
+            if trace is not None:
+                trace.checkpoint(
+                    "prepare_inputs",
+                    req_ids=input_batch.req_ids,
+                    computed=input_batch.num_computed_tokens_np.tolist(),
+                    scheduled=input_batch.num_scheduled_tokens.tolist(),
+                    state_indices=input_batch.idx_mapping_np.tolist(),
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            if trace is not None:
+                trace.checkpoint(
+                    "block_tables_and_slots",
+                    table_shapes=[tuple(table.shape) for table in block_tables],
+                )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1710,6 +1751,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
+            if trace is not None:
+                trace.checkpoint("preprocess_state")
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1765,6 +1808,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs_padded=input_batch.num_reqs_after_padding,
             )
         ubatch_state: UBatchState | None = None
+        if trace is not None:
+            trace.checkpoint("dcp_metadata")
         if batch_desc.num_ubatches > 1:
             assert self.ubatch_runner is not None
             assert block_tables is not None and slot_mappings is not None
@@ -1797,6 +1842,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+        if trace is not None:
+            trace.checkpoint("attention_metadata")
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1823,9 +1870,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 with self.ec_connector.maybe_get_output(
                     scheduler_output
                 ) as ec_connector_output:
+                    if trace is not None:
+                        trace.checkpoint("before_embeddings")
                     inputs_embeds = self.model_state.prepare_inputs_embeds(
                         scheduled_encoder_inputs, input_batch, self.req_states
                     )
+                    if trace is not None:
+                        trace.checkpoint("embeddings")
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 

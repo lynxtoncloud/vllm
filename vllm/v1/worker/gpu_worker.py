@@ -760,6 +760,9 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        input_trace = getattr(self.model_runner, "input_trace", None)
+        if input_trace is not None:
+            input_trace.ready = False
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -934,6 +937,9 @@ class Worker(WorkerBase):
         # Startup is done; steady-state serving gets no benefit from torch
         # intra-op parallelism.
         set_torch_threads_for_runtime()
+
+        if input_trace is not None:
+            input_trace.ready = True
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

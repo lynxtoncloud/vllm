@@ -24,6 +24,92 @@ from vllm.scalar_type import scalar_types
 DEVICE = "cpu"
 
 
+@pytest.mark.parametrize(
+    "dummy,profile,tokens",
+    [(False, False, 1), (True, False, 1), (False, True, 1), (False, False, 0)],
+)
+@pytest.mark.parametrize("ready", [False, True])
+def test_input_trace_runner_excludes_warmup_profiles_and_empty_steps(
+    dummy, profile, tokens, ready
+):
+    """Execute the runner's entry gate without GPU initialization or imports."""
+    path = Path(__file__).parents[2] / "vllm/v1/worker/gpu/model_runner.py"
+    tree = ast.parse(path.read_text())
+    method = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "execute_model"
+    )
+    method.decorator_list = []
+    method.returns = None
+    for arg in method.args.args:
+        arg.annotation = None
+    scope: dict[str, Any] = {}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope)
+    stop = RuntimeError("stop after entry gate")
+    trace = Mock()
+    trace.ready = ready
+    runner = NS(
+        input_trace=trace,
+        update_pp_decode_requests=Mock(side_effect=stop),
+        gather_batch_req_state=Mock(side_effect=stop),
+    )
+    scheduled = {"request": 1}
+    output = NS(total_num_scheduled_tokens=tokens, num_scheduled_tokens=scheduled)
+    with pytest.raises(RuntimeError, match="stop after entry gate"):
+        scope["execute_model"](runner, output, dummy_run=dummy, is_profile=profile)
+    if ready and not dummy and not profile and tokens:
+        trace.begin.assert_called_once_with(scheduled)
+    else:
+        trace.begin.assert_not_called()
+
+
+def test_input_trace_recovery_preserves_workload_and_drops_global_blocking(monkeypatch):
+    scripts = Path(__file__).parents[2] / "examples/disaggregated/glm5next_int8"
+    monkeypatch.syspath_prepend(str(scripts))
+    recovery = importlib.import_module("diagnose_input_preparation")
+    cfg = {
+        "nodes": {"p0": "p", "d0": "d"},
+        "environment": {
+            "ENFORCE_EAGER": "1",
+            "MAX_MODEL_LEN": "1048576",
+            "MAX_BATCHED_TOKENS": "2048",
+            "AMD_SERIALIZE_KERNEL": "3",
+            "VLLM_ROCM_USE_TRITON_MQA_LOGITS": "1",
+        },
+    }
+    original = json.loads(json.dumps(cfg))
+    result = recovery.diagnostic_config(cfg)
+    assert cfg == original
+    for key in (
+        "MAX_MODEL_LEN",
+        "MAX_BATCHED_TOKENS",
+        "VLLM_ROCM_USE_TRITON_MQA_LOGITS",
+    ):
+        assert result["environment"][key] == cfg["environment"][key]
+    assert result["nodes"] == cfg["nodes"]
+    assert result["environment"]["AMD_SERIALIZE_KERNEL"] == "0"
+    assert result["environment"]["VLLM_TRACE_MODEL_INPUTS"] == "1"
+
+
+def test_input_trace_recovery_does_not_signal_reused_controller_pid(
+    monkeypatch, tmp_path
+):
+    scripts = Path(__file__).parents[2] / "examples/disaggregated/glm5next_int8"
+    monkeypatch.syspath_prepend(str(scripts))
+    recovery = importlib.import_module("diagnose_input_preparation")
+    (tmp_path / "pid").write_text("12345")
+    send, close = Mock(), Mock()
+    monkeypatch.setattr(recovery.os, "pidfd_open", Mock(return_value=8), raising=False)
+    monkeypatch.setattr(recovery.os, "close", close)
+    monkeypatch.setattr(recovery.signal, "pidfd_send_signal", send, raising=False)
+    monkeypatch.setattr(Path, "read_bytes", lambda self: b"python\0/other/run.py\0")
+    with pytest.raises(RuntimeError, match="no longer belongs"):
+        recovery.stop_source_controller(tmp_path)
+    send.assert_not_called()
+    close.assert_called_once_with(8)
+
+
 @pytest.mark.parametrize("transfer_tokens", [64, 128, 384])
 def test_nixl_compressed_transfer_preserves_nonconsecutive_block_contents(
     transfer_tokens,
@@ -758,6 +844,96 @@ def test_wna16_failure_capture_is_failure_only_and_preserves_strides(tmp_path):
 def _finite_checks():
     path = Path(__file__).parents[2] / "vllm/models/glm5next/diagnostics.py"
     return runpy.run_path(str(path))["install_finite_checks"]
+
+
+def _input_preparation_trace(monkeypatch):
+    for name in (
+        "AMD_SERIALIZE_KERNEL",
+        "AMD_SERIALIZE_COPY",
+        "HIP_LAUNCH_BLOCKING",
+        "CUDA_LAUNCH_BLOCKING",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    path = Path(__file__).parents[2] / "vllm/v1/worker/gpu/input_trace.py"
+    return runpy.run_path(str(path))["InputPreparationTrace"]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_input_preparation_trace_fences_only_batches_and_exposes_failure(
+    monkeypatch, capsys, fail
+):
+    trace_type = _input_preparation_trace(monkeypatch)
+    fence = Mock()
+    trace = trace_type(rank=9, enforce_eager=True, synchronize=fence)
+    fence.assert_not_called()
+    assert not capsys.readouterr().out
+    trace.begin({"request-a": 2, "request-b": 1})
+    error = RuntimeError("illegal memory access")
+    if fail:
+        fence.side_effect = error
+        with pytest.raises(RuntimeError) as caught:
+            trace.checkpoint("prepare_inputs", lengths=[524287, 32])
+        assert caught.value is error
+    else:
+        trace.checkpoint("prepare_inputs", lengths=[524287, 32])
+    rows = [
+        json.loads(line.removeprefix("Input preparation trace: "))
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    assert [(r["stage"], r["event"]) for r in rows] == [
+        ("batch", "BEGIN"),
+        ("entry", "BEFORE"),
+        ("entry", "DONE"),
+        ("prepare_inputs", "BEFORE"),
+        ("prepare_inputs", "FAILED" if fail else "DONE"),
+    ]
+    assert rows[0]["details"] == {
+        "requests": 2,
+        "tokens": 3,
+        "scheduled_tokens": {"request-a": 2, "request-b": 1},
+    }
+    assert all(r["rank"] == 9 and r["step"] == 1 for r in rows)
+    assert rows[3]["details"] == {"lengths": [524287, 32]}
+    assert fence.call_count == 2
+    fence.side_effect = None
+    trace.begin({"request-c": 1})
+    assert '"step": 2' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "blocking",
+    [
+        None,
+        "AMD_SERIALIZE_KERNEL",
+        "AMD_SERIALIZE_COPY",
+        "HIP_LAUNCH_BLOCKING",
+        "CUDA_LAUNCH_BLOCKING",
+    ],
+)
+def test_input_preparation_trace_rejects_graph_or_global_blocking(
+    monkeypatch, blocking
+):
+    trace_type = _input_preparation_trace(monkeypatch)
+    fence = Mock()
+    if blocking:
+        monkeypatch.setenv(blocking, "3")
+    with pytest.raises(ValueError, match=blocking or "requires eager"):
+        trace_type(rank=0, enforce_eager=blocking is not None, synchronize=fence)
+    fence.assert_not_called()
+
+
+def test_input_preparation_trace_does_not_read_non_cpu_details(monkeypatch):
+    trace_type = _input_preparation_trace(monkeypatch)
+    fence = Mock()
+    trace = trace_type(rank=0, enforce_eager=True, synchronize=fence)
+
+    class DeviceValue:
+        def __repr__(self):
+            raise AssertionError("A device value must not be materialized")
+
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        trace.checkpoint("prepare_inputs", input_ids=DeviceValue())
+    fence.assert_not_called()
 
 
 @pytest.mark.parametrize("fail", [False, True])

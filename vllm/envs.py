@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
+    VLLM_TRACE_MODEL_INPUTS: bool = False
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -1814,6 +1815,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # also enables the NaN computation required to detect them.
     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
+    ),
+    # Fence V2 input-preparation stages for real eager batches only.
+    "VLLM_TRACE_MODEL_INPUTS": lambda: bool(
+        int(os.getenv("VLLM_TRACE_MODEL_INPUTS", "0"))
     ),
     # Eager-only module-boundary diagnostics for GLM-5.3-Flash.
     # Qualification opt-in; keep the Torch oracle available for A/B comparisons.

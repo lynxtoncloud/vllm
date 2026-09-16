@@ -67,6 +67,7 @@ def command(cfg, role, kind, directory):
         "VLLM_ROCM_GFX1100_GLM53",
         "VLLM_GLM5NEXT_CHECK_FINITE",
         "VLLM_GLM5NEXT_TRACE_VISION",
+        "VLLM_TRACE_MODEL_INPUTS",
         "VLLM_GLM5NEXT_DUMP_DIR",
         "VLLM_GLM5NEXT_ISOLATE_GEMM2",
         "VLLM_ROCM_USE_TRITON_MQA_LOGITS",
