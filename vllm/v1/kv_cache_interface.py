@@ -971,6 +971,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 class KpoolTailSpec(SlidingWindowSpec):
     """One-block circular scratch cache for a kpool indexer's raw tail."""
 
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:

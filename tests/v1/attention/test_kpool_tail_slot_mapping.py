@@ -55,6 +55,19 @@ def test_tail_backend_layout_matches_kernel_pointer_arithmetic():
     assert content_stride == 1
 
 
+def test_tail_spec_uses_builder_slot_mapping():
+    spec = KpoolTailSpec(
+        block_size=KPOOL,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=KPOOL,
+    )
+
+    assert not spec.uses_slot_mapping
+
+
 def make_tail_block_table(own_blocks, width=64):
     """Tail-group block table as BlockTables produces it: column 0 holds the
     request's single KpoolTailManager block, the remaining columns are never

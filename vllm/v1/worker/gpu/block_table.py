@@ -342,7 +342,7 @@ def _compute_slot_mappings_kernel(
         block_offsets = local_positions % kernel_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local,
+            mask=is_local & mapping_enabled & (offset < end_idx),
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
