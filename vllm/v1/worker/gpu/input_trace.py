@@ -17,7 +17,7 @@ _active_trace: ContextVar["InputPreparationTrace | None"] = ContextVar(
 
 
 def gpu_memory_snapshot(device: torch.device) -> dict[str, int]:
-    free, total = torch.accelerator.mem_get_info(device)
+    free, total = torch.accelerator.get_memory_info(device)
     return {
         "free_bytes": free,
         "total_bytes": total,

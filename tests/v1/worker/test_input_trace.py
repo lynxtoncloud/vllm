@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+import vllm.v1.worker.gpu.input_trace as input_trace
 from vllm.v1.worker.gpu.input_trace import (
     InputPreparationTrace,
     activate_input_trace,
@@ -12,6 +15,33 @@ from vllm.v1.worker.gpu.input_trace import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_gpu_memory_snapshot_uses_accelerator_api(monkeypatch):
+    device: Any = object()
+    calls: list[object] = []
+
+    def get_memory_info(value: object) -> tuple[int, int]:
+        calls.append(value)
+        return 80, 100
+
+    monkeypatch.setattr(
+        input_trace.torch,
+        "accelerator",
+        SimpleNamespace(
+            get_memory_info=get_memory_info,
+            memory_allocated=lambda value: 12,
+            memory_reserved=lambda value: 20,
+        ),
+    )
+
+    assert input_trace.gpu_memory_snapshot(device) == {
+        "free_bytes": 80,
+        "total_bytes": 100,
+        "allocated_bytes": 12,
+        "reserved_bytes": 20,
+    }
+    assert calls == [device]
 
 
 def test_trace_span_records_synchronized_memory_and_request(capsys):

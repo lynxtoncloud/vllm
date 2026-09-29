@@ -54,7 +54,12 @@ compilation and CUDA graphs disabled. Each rank logs the request IDs and
 `BEGIN`/`READY`/`EXECUTED`/`DONE`/`FAILED` events for multimodal input preparation, encoder
 execution, embedding collection, and embedding merge. GLM-5.3 vision logs
 patch embedding, metadata, each numbered block, attention kernels, TP
-projections, and the merger. A completed span includes elapsed milliseconds
+projections, and the merger. The merger is split into `vision_downsample`,
+`vision_merger_gather_projection`, `vision_merger_norm_activation`,
+`vision_merger_gate_up_projection`, `vision_merger_activation`, and
+`vision_merger_reduce_projection`. The gather and reduce projection spans
+include both the matrix operation and any TP communication performed by the
+parallel linear layer. A completed span includes elapsed milliseconds
 and free, total, allocated, and reserved GPU memory before and after it.
 Memory sampling failures appear as an `error` field and do not abort inference.
 `ready_ms`, `body_ms`, and `sync_ms` split the completed span into its

@@ -329,11 +329,16 @@ class Glm5NextPatchMerger(nn.Module):
         self.extra_activation_func = nn.GELU()
 
     def forward(self, x: torch.Tensor):
-        x, _ = self.proj(x)
-        x = self.extra_activation_func(self.post_projection_norm(x))
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        with trace_span("vision_merger_gather_projection", input_rows=x.shape[0]):
+            x, _ = self.proj(x)
+        with trace_span("vision_merger_norm_activation"):
+            x = self.extra_activation_func(self.post_projection_norm(x))
+        with trace_span("vision_merger_gate_up_projection"):
+            gate_up, _ = self.gate_up_proj(x)
+        with trace_span("vision_merger_activation"):
+            x = self.act_fn(gate_up)
+        with trace_span("vision_merger_reduce_projection"):
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -604,12 +609,13 @@ class Glm5NextVisionTransformer(nn.Module):
                 )
 
         with trace_span("vision_merger"):
-            x = self.post_layernorm(x)
-            x = x.view(
-                -1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1]
-            )
-            x = x.permute(0, 3, 1, 2)
-            x = self.downsample(x).view(-1, self.out_hidden_size)
+            with trace_span("vision_downsample", input_rows=x.shape[0]):
+                x = self.post_layernorm(x)
+                x = x.view(
+                    -1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1]
+                )
+                x = x.permute(0, 3, 1, 2)
+                x = self.downsample(x).view(-1, self.out_hidden_size)
             x = self.merger(x)
         return x
 
