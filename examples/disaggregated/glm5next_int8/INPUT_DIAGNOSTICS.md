@@ -48,6 +48,29 @@ failing synchronization interval, not necessarily one individual kernel.
 The entry fence can report faults left by earlier forward/sampling/transfer work.
 All metadata printed before a fence is CPU data or tensor shape metadata.
 
+For a P-side image or video failure, start both P0 and P1 with
+`ENFORCE_EAGER=1 VLLM_TRACE_MODEL_INPUTS=1` and keep multimodal encoder
+compilation and CUDA graphs disabled. Each rank logs the request IDs and
+`BEGIN`/`READY`/`EXECUTED`/`DONE`/`FAILED` events for multimodal input preparation, encoder
+execution, embedding collection, and embedding merge. GLM-5.3 vision logs
+patch embedding, metadata, each numbered block, attention kernels, TP
+projections, and the merger. A completed span includes elapsed milliseconds
+and free, total, allocated, and reserved GPU memory before and after it.
+Memory sampling failures appear as an `error` field and do not abort inference.
+`ready_ms`, `body_ms`, and `sync_ms` split the completed span into its
+entry fence, model call, and exit fence.
+
+Compare the last `BEGIN` without a matching `DONE` on every rank. `BEGIN`
+without `READY` points to the entry fence or memory sampling; `READY` without
+`EXECUTED` points to the wrapped call; `EXECUTED` without `DONE` points to the
+exit fence. A stalled
+`vision_attention_tp_projection` or `vision_mlp_tp_projection` includes the
+projection and its possible TP collective; the trace alone cannot distinguish
+the two kernels. A `BEGIN` with no `DONE` can also mean a synchronization fence
+is waiting for earlier asynchronous GPU work. Disable tracing and restart the
+workers after collecting the diagnostic logs because per-stage fences affect
+timing and throughput.
+
 This controller leaves D running after the replay for inspection. Before a new
 attempt, stop it using the managed D0/D1 run ID. To return to performance testing,
 restart D with tracing disabled and restore the original logging configuration.

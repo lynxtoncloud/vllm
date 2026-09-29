@@ -19,6 +19,7 @@ from vllm.multimodal.utils import (
     set_mm_embedding_modality,
 )
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+from vllm.v1.worker.gpu.input_trace import is_input_trace_active, trace_span
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import (
     EncoderTimingStats,
@@ -154,19 +155,49 @@ class EncoderRunner:
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
         ):
-            cg_manager = self.cudagraph_manager
-            cudagraph_output = (
-                cg_manager.execute(mm_kwargs_batch)
-                if cg_manager is not None
-                and cg_manager.is_captured()
-                and cg_manager.supports_modality(modality)
-                else None
-            )
-            batch_outputs = (
-                cudagraph_output
-                if cudagraph_output is not None
-                else self.model.embed_multimodal(**mm_kwargs_batch)
-            )
+            details: dict[str, object] = {}
+            if is_input_trace_active():
+                pixel_values = mm_kwargs_batch.get(
+                    "pixel_values_videos" if modality == "video" else "pixel_values"
+                )
+                grid_thw = mm_kwargs_batch.get(
+                    "video_grid_thw" if modality == "video" else "image_grid_thw"
+                )
+                details = {
+                    "pixel_values_shape": (
+                        list(pixel_values.shape)
+                        if isinstance(pixel_values, torch.Tensor)
+                        else None
+                    ),
+                    "grid_rows": (
+                        len(grid_thw) if isinstance(grid_thw, torch.Tensor) else None
+                    ),
+                    "grid_thw": (
+                        grid_thw[:32].tolist()
+                        if isinstance(grid_thw, torch.Tensor)
+                        and grid_thw.device.type == "cpu"
+                        else None
+                    ),
+                }
+            with trace_span(
+                "mm_embed_multimodal",
+                modality=modality,
+                items=num_items,
+                **details,
+            ):
+                cg_manager = self.cudagraph_manager
+                cudagraph_output = (
+                    cg_manager.execute(mm_kwargs_batch)
+                    if cg_manager is not None
+                    and cg_manager.is_captured()
+                    and cg_manager.supports_modality(modality)
+                    else None
+                )
+                batch_outputs = (
+                    cudagraph_output
+                    if cudagraph_output is not None
+                    else self.model.embed_multimodal(**mm_kwargs_batch)
+                )
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
         return encoder_outputs

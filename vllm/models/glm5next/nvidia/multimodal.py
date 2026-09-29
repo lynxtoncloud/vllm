@@ -43,6 +43,7 @@ from vllm.model_executor.models.vision import (
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.gpu.input_trace import trace_span
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
@@ -108,7 +109,8 @@ class Glm5NextVisionMLP(nn.Module):
     def forward(self, x: torch.Tensor):
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
-        x, _ = self.down_proj(x)
+        with trace_span("vision_mlp_tp_projection"):
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -216,16 +218,18 @@ class Glm5NextVisionAttention(nn.Module):
             )
             q, k = torch.chunk(qk_rotated, 2, dim=0)
 
-        context_layer = self.attn(
-            query=q,
-            key=k,
-            value=v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
+        with trace_span("vision_attention_kernel"):
+            context_layer = self.attn(
+                query=q,
+                key=k,
+                value=v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
         context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
 
-        output, _ = self.proj(context_layer)
+        with trace_span("vision_attention_tp_projection"):
+            output, _ = self.proj(context_layer)
         return output
 
 
@@ -563,47 +567,50 @@ class Glm5NextVisionTransformer(nn.Module):
         *,
         encoder_metadata: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        # patchify
-        x = x.to(device=self.device, dtype=self.dtype)
-        x = self.patch_embed(x)
+        with trace_span("vision_patch_embed", patches=x.shape[0]):
+            x = x.to(device=self.device, dtype=self.dtype)
+            x = self.patch_embed(x)
 
-        if encoder_metadata is not None:
-            # Encoder CUDA-graph path (PR #49852): rotary/cu_seqlens/max_seqlen are
-            # precomputed by prepare_encoder_metadata (which uses rot_pos_emb exactly
-            # as the eager rebuild does), so reuse them and skip the per-call CPU
-            # rebuild (the low-GPU-util culprit on multimodal workloads).
-            rotary_pos_emb_cos = encoder_metadata["rotary_pos_emb_cos"]
-            rotary_pos_emb_sin = encoder_metadata["rotary_pos_emb_sin"]
-            cu_seqlens = encoder_metadata["cu_seqlens"]
-            max_seqlen = encoder_metadata["max_seqlen"]
-        else:
-            if isinstance(grid_thw, list):
-                grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
-            rotary_pos_emb_cos, rotary_pos_emb_sin, _ = self.rot_pos_emb(grid_thw)
-            cu_seqlens = torch.repeat_interleave(
-                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-            ).cumsum(dim=0, dtype=torch.int32)
-            cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
-            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
-            max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        with trace_span("vision_metadata"):
+            if encoder_metadata is not None:
+                # Encoder CUDA-graph path (PR #49852): rotary/cu_seqlens/max_seqlen are
+                # precomputed by prepare_encoder_metadata (using rot_pos_emb exactly
+                # as the eager rebuild does), so reuse them and skip the per-call CPU
+                # rebuild (the low-GPU-util culprit on multimodal workloads).
+                rotary_pos_emb_cos = encoder_metadata["rotary_pos_emb_cos"]
+                rotary_pos_emb_sin = encoder_metadata["rotary_pos_emb_sin"]
+                cu_seqlens = encoder_metadata["cu_seqlens"]
+                max_seqlen = encoder_metadata["max_seqlen"]
+            else:
+                if isinstance(grid_thw, list):
+                    grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+                rotary_pos_emb_cos, rotary_pos_emb_sin, _ = self.rot_pos_emb(grid_thw)
+                cu_seqlens = torch.repeat_interleave(
+                    grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+                ).cumsum(dim=0, dtype=torch.int32)
+                cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+                cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+                max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
-        # transformers
         x = x.unsqueeze(1)
-        for blk in self.blocks:
-            x = blk(
-                x,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb_cos=rotary_pos_emb_cos,
-                rotary_pos_emb_sin=rotary_pos_emb_sin,
-                max_seqlen=max_seqlen,
-            )
+        for index, block in enumerate(self.blocks):
+            with trace_span("vision_block", block=index):
+                x = block(
+                    x,
+                    cu_seqlens=cu_seqlens,
+                    rotary_pos_emb_cos=rotary_pos_emb_cos,
+                    rotary_pos_emb_sin=rotary_pos_emb_sin,
+                    max_seqlen=max_seqlen,
+                )
 
-        # adapter
-        x = self.post_layernorm(x)
-        x = x.view(-1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1])
-        x = x.permute(0, 3, 1, 2)
-        x = self.downsample(x).view(-1, self.out_hidden_size)
-        x = self.merger(x)
+        with trace_span("vision_merger"):
+            x = self.post_layernorm(x)
+            x = x.view(
+                -1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1]
+            )
+            x = x.permute(0, 3, 1, 2)
+            x = self.downsample(x).view(-1, self.out_hidden_size)
+            x = self.merger(x)
         return x
 
     def load_weights(self, weights) -> set[str]:

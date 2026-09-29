@@ -127,6 +127,7 @@ from vllm.v1.worker.gpu.input_batch import (
     prepare_prefill_inputs,
     set_dummy_context,
 )
+from vllm.v1.worker.gpu.input_trace import activate_input_trace, gpu_memory_snapshot
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     KVConnector,
@@ -209,12 +210,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if envs.VLLM_TRACE_MODEL_INPUTS:
             from vllm.v1.worker.gpu.input_trace import InputPreparationTrace
 
+            if (
+                self.compilation_config.compile_mm_encoder
+                or self.compilation_config.cudagraph_mm_encoder
+            ):
+                raise ValueError(
+                    "Input preparation tracing requires eager multimodal encoding"
+                )
             self.input_trace = InputPreparationTrace(
                 rank=self.parallel_config.rank,
                 enforce_eager=self.model_config.enforce_eager,
                 synchronize=functools.partial(
                     torch.accelerator.synchronize, device.index
                 ),
+                memory_snapshot=functools.partial(gpu_memory_snapshot, device),
             )
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
@@ -1872,9 +1881,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) as ec_connector_output:
                     if trace is not None:
                         trace.checkpoint("before_embeddings")
-                    inputs_embeds = self.model_state.prepare_inputs_embeds(
-                        scheduled_encoder_inputs, input_batch, self.req_states
-                    )
+                    with activate_input_trace(trace):
+                        inputs_embeds = self.model_state.prepare_inputs_embeds(
+                            scheduled_encoder_inputs, input_batch, self.req_states
+                        )
                     if trace is not None:
                         trace.checkpoint("embeddings")
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):

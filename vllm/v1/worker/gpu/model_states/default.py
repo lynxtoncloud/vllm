@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     compute_mm_prefix_ranges,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_trace import trace_span
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.rope import get_rope_state
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -105,18 +106,21 @@ class DefaultModelState(ModelState):
         input_ids_unpadded = input_batch.input_ids[: input_batch.num_tokens]
 
         if self.supports_mm_inputs:
-            self.execute_mm_encoder(scheduled_encoder_inputs)
+            with trace_span("mm_encoder"):
+                self.execute_mm_encoder(scheduled_encoder_inputs)
 
-            mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
+            with trace_span("mm_gather_embeddings"):
+                mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
             if self.mm_pruner is not None and mm_embeds:
                 # EVS: recompute mrope positions for pruned media.
                 mm_embeds = self.mm_pruner.recompute(mm_embeds, input_batch, req_states)
                 # We must flush the staged rope updates for prepare_inputs() to pick up.
                 self.apply_staged_writes()
 
-            inputs_embeds = self.encoder_runner.get_inputs_embeds(
-                input_ids_unpadded, mm_embeds, is_mm_embed
-            )
+            with trace_span("mm_merge_embeddings"):
+                inputs_embeds = self.encoder_runner.get_inputs_embeds(
+                    input_ids_unpadded, mm_embeds, is_mm_embed
+                )
         else:
             input_embeddings = self.model.embed_input_ids(input_ids_unpadded)
             self.inputs_embeds[: input_embeddings.shape[0]] = input_embeddings

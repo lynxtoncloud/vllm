@@ -20,6 +20,8 @@
     "MAX_BATCHED_TOKENS": "512",
     "GPU_MEMORY_UTILIZATION": "0.90",
     "ENFORCE_EAGER": "1",
+    "VLLM_TRACE_MODEL_INPUTS": "1",
+    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "900",
     "UCX_ROCM_COPY_DMABUF": "y",
     "UCX_IB_GDA_DMABUF_ENABLE": "y",
     "LD_LIBRARY_PATH": "/data/opt/ucx/lib:/opt/rocm/lib:/opt/rocm/lib64",

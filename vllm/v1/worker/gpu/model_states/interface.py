@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_trace import trace_span
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.states import RequestState
@@ -177,9 +178,10 @@ class ModelState(ABC):
         The encode half of `get_mm_embeddings`, without the gather, for callers
         that run no language model.
         """
-        mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
-            scheduled_encoder_inputs
-        )
+        with trace_span("mm_prepare_inputs"):
+            mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
+                scheduled_encoder_inputs
+            )
         if mm_kwargs:
             with self.encoder_runner.timed_encoder_operation(
                 scheduled_encoder_inputs.keys()
