@@ -83,6 +83,9 @@ fi
 if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
   cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
 fi
+if [[ -n "${PROFILE_CONFIG:-}" ]]; then
+  cmd+=(--profiler-config "$PROFILE_CONFIG")
+fi
 if [[ "$rank" == 1 ]]; then
   cmd+=(--headless)
 fi

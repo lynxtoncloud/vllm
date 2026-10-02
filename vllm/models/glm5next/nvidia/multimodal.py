@@ -610,12 +610,23 @@ class Glm5NextVisionTransformer(nn.Module):
 
         with trace_span("vision_merger"):
             with trace_span("vision_downsample", input_rows=x.shape[0]):
-                x = self.post_layernorm(x)
-                x = x.view(
-                    -1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1]
-                )
-                x = x.permute(0, 3, 1, 2)
-                x = self.downsample(x).view(-1, self.out_hidden_size)
+                with trace_span("vision_downsample_norm"):
+                    x = self.post_layernorm(x)
+                with trace_span("vision_downsample_layout"):
+                    x = x.view(
+                        -1,
+                        self.spatial_merge_size,
+                        self.spatial_merge_size,
+                        x.shape[-1],
+                    )
+                    x = x.permute(0, 3, 1, 2)
+                with trace_span(
+                    "vision_downsample_conv",
+                    input_shape=tuple(x.shape),
+                    input_strides=x.stride(),
+                    dtype=str(x.dtype),
+                ):
+                    x = self.downsample(x).view(-1, self.out_hidden_size)
             x = self.merger(x)
         return x
 
