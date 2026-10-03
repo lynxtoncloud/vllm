@@ -626,7 +626,7 @@ class Glm5NextVisionTransformer(nn.Module):
                     input_strides=x.stride(),
                     dtype=str(x.dtype),
                 ):
-                    x = self.downsample(x).view(-1, self.out_hidden_size)
+                    x = self.downsample.forward_native(x).view(-1, self.out_hidden_size)
             x = self.merger(x)
         return x
 

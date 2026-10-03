@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_trace import trace_span
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -209,25 +210,31 @@ class MambaHybridModelState(DefaultModelState):
         # the launch cost is ~0.3% of TPOT, so the GPU fast-exit suffices.)
         block = 256
         grid = (triton.cdiv(num_reqs, block),)
-        preprocess_mamba_align_fused_kernel[grid](
-            input_batch.idx_mapping,
-            self._mamba_state_idx_gpu,
-            num_computed_tokens,
-            input_batch.query_start_loc,
-            self.num_accepted_tokens_gpu,
-            self._mamba_src_col_gpu,
-            self._mamba_src_off_gpu,
-            num_reqs,
-            BLOCK_SIZE=block,
-            MAMBA_BLOCK_SIZE=mamba_spec.block_size,
-        )
-        ctx.run_fused_precopy(
-            num_reqs,
-            self._mamba_state_idx_gpu,
-            self._mamba_src_col_gpu,
-            self._mamba_src_off_gpu,
-            input_batch.idx_mapping,
-        )
+        with trace_span(
+            "mamba_align_update",
+            num_reqs=num_reqs,
+            mamba_block_size=mamba_spec.block_size,
+        ):
+            preprocess_mamba_align_fused_kernel[grid](
+                input_batch.idx_mapping,
+                self._mamba_state_idx_gpu,
+                num_computed_tokens,
+                input_batch.query_start_loc,
+                self.num_accepted_tokens_gpu,
+                self._mamba_src_col_gpu,
+                self._mamba_src_off_gpu,
+                num_reqs,
+                BLOCK_SIZE=block,
+                MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            )
+        with trace_span("mamba_align_precopy", num_reqs=num_reqs):
+            ctx.run_fused_precopy(
+                num_reqs,
+                self._mamba_state_idx_gpu,
+                self._mamba_src_col_gpu,
+                self._mamba_src_off_gpu,
+                input_batch.idx_mapping,
+            )
 
     def prepare_attn(
         self,

@@ -1754,12 +1754,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
-            self.model_state.preprocess_state(
-                input_batch,
-                block_tables,
-                self.kv_cache_config,
-                self.req_states.num_computed_tokens.gpu,
-            )
+            with activate_input_trace(trace):
+                self.model_state.preprocess_state(
+                    input_batch,
+                    block_tables,
+                    self.kv_cache_config,
+                    self.req_states.num_computed_tokens.gpu,
+                )
             if trace is not None:
                 trace.checkpoint("preprocess_state")
 
